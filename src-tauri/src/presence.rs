@@ -1,9 +1,11 @@
 //! Discord activity: "Playing AION2 — Naicha · Cleric · Lv 29 — Kaisinel (Elyos) · Europe".
 //!
 //! Opt-in (`dpsMeter.discordActivity`), and shown only while AION2 is open.
-//! It talks to the Discord app on this computer over its local IPC socket, so
-//! it needs no a2tools.app account and sends nothing anywhere else: Discord
-//! already knows who its own user is.
+//! It talks to the Discord apps on this computer over their local IPC sockets,
+//! so it needs no a2tools.app account and sends nothing anywhere else: Discord
+//! already knows who its own user is. Every Discord running is told (Discord
+//! and Vesktop side by side each have a socket, and Discord shows the activity
+//! of whichever one you use), not only the first one found.
 //!
 //! Everything shown is what the game has told the meter about the local
 //! player (see `DataStorage::local_profile`): class and level from the self
@@ -15,8 +17,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use std::io::{Read, Write};
+
 use discord_rich_presence::activity::{Activity, Assets, Timestamps};
-use discord_rich_presence::{DiscordIpc, DiscordIpcClient};
 use tauri::Manager;
 
 use crate::app::AppState;
@@ -75,10 +78,10 @@ pub fn spawn(app: tauri::AppHandle) {
 }
 
 fn run(app: tauri::AppHandle) {
-    let mut client: Option<DiscordIpcClient> = None;
+    let mut discords = Discords::default();
     let mut shown: Option<Shown> = None;
     let mut game_since: Option<i64> = None;
-    let mut last_attempt: Option<Instant> = None;
+    let mut last_scan: Option<Instant> = None;
     loop {
         std::thread::sleep(TICK);
         let Some(state) = app.try_state::<AppState>() else { continue };
@@ -88,9 +91,8 @@ fn run(app: tauri::AppHandle) {
             game_since = None;
         }
         if !enabled || !playing {
-            if let Some(mut c) = client.take() {
-                let _ = c.clear_activity();
-                let _ = c.close();
+            if !discords.is_empty() {
+                discords.clear_all();
                 tracing::info!("Discord activity cleared");
             }
             shown = None;
@@ -101,28 +103,18 @@ fn run(app: tauri::AppHandle) {
         let lang = state.settings.get("dpsMeter.language").unwrap_or_else(|| "en".into());
         let text = Texts::load(state.i18n_data_dir.as_ref(), &lang);
         let next = describe(&state.data_storage, &state, &text, &lang);
-        if shown.as_ref() == Some(&next) && client.is_some() {
+
+        // A Discord started after the game is picked up on a later scan, and
+        // told the current activity even when it has not changed.
+        let mut joined = false;
+        if last_scan.is_none_or(|t| t.elapsed() >= RECONNECT_EVERY) {
+            last_scan = Some(Instant::now());
+            joined = discords.connect_new();
+        }
+        if discords.is_empty() || (shown.as_ref() == Some(&next) && !joined) {
             continue;
         }
 
-        if client.is_none() {
-            if last_attempt.is_some_and(|t| t.elapsed() < RECONNECT_EVERY) {
-                continue;
-            }
-            last_attempt = Some(Instant::now());
-            let mut c = DiscordIpcClient::new(DISCORD_APPLICATION_ID);
-            match c.connect() {
-                Ok(()) => {
-                    tracing::info!("Discord activity: connected to Discord");
-                    client = Some(c);
-                }
-                Err(e) => {
-                    tracing::debug!("Discord activity: Discord not reachable ({e})");
-                    continue;
-                }
-            }
-        }
-        let Some(c) = client.as_mut() else { continue };
         let mut assets = Assets::new().small_image("a2tools").small_text("A2Tools DPS Meter");
         // The image's hover text is the class with its level ("Cleric · Lv
         // 30"): the line beside it adds the name.
@@ -136,16 +128,176 @@ fn run(app: tauri::AppHandle) {
         if !next.state.is_empty() {
             activity = activity.state(next.state.as_str());
         }
-        match c.set_activity(activity) {
-            Ok(()) => shown = Some(next),
-            Err(e) => {
-                // Discord closed or restarted: connect again on a later tick.
-                tracing::info!("Discord activity: lost Discord ({e}); will reconnect");
-                client = None;
-                shown = None;
+        let activity = serde_json::to_value(activity).unwrap_or(serde_json::Value::Null);
+        discords.set_all(&activity);
+        // Discord closed in the meantime: told again once it is back.
+        shown = if discords.is_empty() { None } else { Some(next) };
+    }
+}
+
+/// One connection per Discord socket found (`discord-ipc-0` … `-9`, also
+/// inside Flatpak and Snap sandboxes), by the socket's path.
+#[derive(Default)]
+struct Discords {
+    open: Vec<(PathBuf, IpcStream)>,
+    nonce: u64,
+}
+
+#[cfg(unix)]
+type IpcStream = std::os::unix::net::UnixStream;
+#[cfg(windows)]
+type IpcStream = std::fs::File;
+
+impl Discords {
+    fn is_empty(&self) -> bool {
+        self.open.is_empty()
+    }
+
+    /// Connects to every Discord not connected yet; true when one was added.
+    fn connect_new(&mut self) -> bool {
+        let mut added = false;
+        for path in ipc_paths() {
+            if self.open.iter().any(|(p, _)| *p == path) {
+                continue;
+            }
+            match handshake(&path) {
+                Ok((stream, who)) => {
+                    tracing::info!("Discord activity: connected to {} ({who})", path.display());
+                    self.open.push((path, stream));
+                    added = true;
+                }
+                // A socket left behind by a Discord that crashed.
+                Err(e) => tracing::debug!("Discord activity: {} not reachable ({e})", path.display()),
+            }
+        }
+        added
+    }
+
+    fn set_all(&mut self, activity: &serde_json::Value) {
+        let mut keep = Vec::with_capacity(self.open.len());
+        for (path, mut stream) in std::mem::take(&mut self.open) {
+            self.nonce += 1;
+            let request = serde_json::json!({
+                "cmd": "SET_ACTIVITY",
+                "args": { "pid": std::process::id(), "activity": activity },
+                "nonce": format!("a2tools-{}", self.nonce),
+            });
+            match send(&mut stream, 1, &request).and_then(|()| recv(&mut stream)) {
+                Ok(reply) => {
+                    if reply.get("evt").and_then(|e| e.as_str()) == Some("ERROR") {
+                        tracing::warn!("Discord activity: {} refused it: {}", path.display(), reply["data"]);
+                    }
+                    keep.push((path, stream));
+                }
+                // Discord closed or restarted: connect again on a later scan.
+                Err(e) => tracing::info!("Discord activity: lost {} ({e}); will reconnect", path.display()),
+            }
+        }
+        self.open = keep;
+    }
+
+    fn clear_all(&mut self) {
+        for (_, mut stream) in std::mem::take(&mut self.open) {
+            self.nonce += 1;
+            let request = serde_json::json!({
+                "cmd": "SET_ACTIVITY",
+                "args": { "pid": std::process::id() },
+                "nonce": format!("a2tools-{}", self.nonce),
+            });
+            let _ = send(&mut stream, 1, &request).and_then(|()| recv(&mut stream));
+        }
+    }
+}
+
+/// Where Discord apps put their sockets, as the `discord-rich-presence`
+/// crate searches them, but every one that exists rather than the first.
+#[cfg(unix)]
+fn ipc_paths() -> Vec<PathBuf> {
+    const SUBPATHS: [&str; 7] = [
+        "",
+        "app/com.discordapp.Discord/",
+        "app/dev.vencord.Vesktop/",
+        ".flatpak/com.discordapp.Discord/xdg-run/",
+        ".flatpak/dev.vencord.Vesktop/xdg-run/",
+        "snap.discord-canary/",
+        "snap.discord/",
+    ];
+    let mut found = Vec::new();
+    for key in ["XDG_RUNTIME_DIR", "TMPDIR", "TMP", "TEMP"] {
+        let Ok(base) = std::env::var(key) else { continue };
+        let base = PathBuf::from(base);
+        for sub in SUBPATHS {
+            for i in 0..10 {
+                let path = base.join(sub).join(format!("discord-ipc-{i}"));
+                if path.exists() && !found.contains(&path) {
+                    found.push(path);
+                }
             }
         }
     }
+    found
+}
+
+#[cfg(windows)]
+fn ipc_paths() -> Vec<PathBuf> {
+    (0..10)
+        .map(|i| PathBuf::from(format!(r"\\.\pipe\discord-ipc-{i}")))
+        .filter(|p| std::fs::metadata(p).is_ok())
+        .collect()
+}
+
+#[cfg(unix)]
+fn open_ipc(path: &PathBuf) -> std::io::Result<IpcStream> {
+    let stream = std::os::unix::net::UnixStream::connect(path)?;
+    // Discord answers at once; a hung one must not stall the activity thread.
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+    Ok(stream)
+}
+
+#[cfg(windows)]
+fn open_ipc(path: &PathBuf) -> std::io::Result<IpcStream> {
+    std::fs::OpenOptions::new().read(true).write(true).open(path)
+}
+
+/// Opens the socket and says hello as the AION2 application; returns the
+/// stream and the Discord user it answered for.
+fn handshake(path: &PathBuf) -> std::io::Result<(IpcStream, String)> {
+    let mut stream = open_ipc(path)?;
+    send(&mut stream, 0, &serde_json::json!({ "v": 1, "client_id": DISCORD_APPLICATION_ID }))?;
+    let reply = recv(&mut stream)?;
+    if reply.get("evt").and_then(|e| e.as_str()) != Some("READY") {
+        return Err(std::io::Error::other(format!("handshake refused: {reply}")));
+    }
+    let who = reply["data"]["user"]["username"].as_str().unwrap_or("?").to_string();
+    Ok((stream, who))
+}
+
+/// One frame: opcode and length (little-endian u32 each), then the JSON.
+fn send(stream: &mut IpcStream, opcode: u32, body: &serde_json::Value) -> std::io::Result<()> {
+    let body = body.to_string();
+    let mut frame = Vec::with_capacity(8 + body.len());
+    frame.extend_from_slice(&opcode.to_le_bytes());
+    frame.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    frame.extend_from_slice(body.as_bytes());
+    stream.write_all(&frame)
+}
+
+fn recv(stream: &mut IpcStream) -> std::io::Result<serde_json::Value> {
+    let mut header = [0u8; 8];
+    stream.read_exact(&mut header)?;
+    let opcode = u32::from_le_bytes(header[..4].try_into().unwrap());
+    let len = u32::from_le_bytes(header[4..].try_into().unwrap()) as usize;
+    if len > 1 << 20 {
+        return Err(std::io::Error::other("reply too large"));
+    }
+    let mut body = vec![0u8; len];
+    stream.read_exact(&mut body)?;
+    // Opcode 2: Discord is closing this connection.
+    if opcode == 2 {
+        return Err(std::io::Error::other(String::from_utf8_lossy(&body).into_owned()));
+    }
+    serde_json::from_slice(&body).map_err(std::io::Error::other)
 }
 
 /// The class's art-asset key in the Discord application.

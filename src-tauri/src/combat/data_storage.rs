@@ -491,6 +491,14 @@ struct Inner {
     actor_power_scalars: HashMap<i32, HashSet<i32>>,
     hostile_target_ids: HashSet<i32>,
     dead_entity_ids: HashSet<i32>,
+    /// Boss kills (NPC code, unix ms) not yet picked up by the app's timer
+    /// tick, which starts respawn countdowns from them. Not cleared by a reset.
+    pending_boss_kills: Vec<(i32, i64)>,
+    /// Field bosses from the map's list (spawn id → alive, unix ms: the
+    /// respawn when dead, the spawn when alive), all maps seen. Not cleared by
+    /// a reset. `field_bosses_dirty` until the app's timer tick takes them.
+    field_bosses: HashMap<i32, (bool, i64)>,
+    field_bosses_dirty: bool,
     /// Linked summons that left the world (`42 36` flag 7). Their damage over
     /// time ticks on, but the game's Damage Analyzer counts no tick after the
     /// spirit is gone, so the meter does not either. Kept through a reset, like
@@ -610,6 +618,9 @@ impl DataStorage {
                 actor_power_scalars: HashMap::new(),
                 hostile_target_ids: HashSet::new(),
                 dead_entity_ids: HashSet::new(),
+                pending_boss_kills: Vec::new(),
+                field_bosses: HashMap::new(),
+                field_bosses_dirty: false,
                 despawned_summon_ids: HashSet::new(),
                 boss_entity_ids: HashSet::new(),
                 training_dummy_ids: HashSet::new(),
@@ -1299,6 +1310,40 @@ impl DataStorage {
         if inner.summon_storage.contains_key(&id) {
             inner.despawned_summon_ids.insert(id);
         }
+    }
+
+    /// A boss with NPC code `code` died in combat at `unix_ms`.
+    pub fn note_boss_kill(&self, code: i32, unix_ms: i64) {
+        let mut inner = self.inner.write();
+        // Bounded: only drained while the app runs its timer tick.
+        if inner.pending_boss_kills.len() < 64 {
+            inner.pending_boss_kills.push((code, unix_ms));
+        }
+    }
+
+    /// The map's field boss list arrived: (spawn id, alive, unix ms) each.
+    pub fn note_field_bosses(&self, bosses: &[(i32, bool, i64)]) {
+        let mut inner = self.inner.write();
+        for &(id, alive, ms) in bosses {
+            if inner.field_bosses.insert(id, (alive, ms)) != Some((alive, ms)) {
+                inner.field_bosses_dirty = true;
+            }
+        }
+    }
+
+    /// Every field boss known, if anything changed since the last call.
+    pub fn take_field_bosses_if_changed(&self) -> Option<HashMap<i32, (bool, i64)>> {
+        let mut inner = self.inner.write();
+        if !inner.field_bosses_dirty {
+            return None;
+        }
+        inner.field_bosses_dirty = false;
+        Some(inner.field_bosses.clone())
+    }
+
+    /// Boss kills since the last call, oldest first.
+    pub fn take_boss_kills(&self) -> Vec<(i32, i64)> {
+        std::mem::take(&mut self.inner.write().pending_boss_kills)
     }
 
     pub fn is_entity_dead(&self, entity_id: i32) -> bool {

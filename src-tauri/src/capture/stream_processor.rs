@@ -276,6 +276,7 @@ impl StreamProcessor {
         self.parse_death_packet(packet);
         self.parse_zone_change_packet(packet);
         self.parse_map_load_packet(packet);
+        self.parse_field_boss_list_packet(packet);
 
         if !parsed_damage && !parsed_name && !parsed_summon && !parsed_ownership && !parsed_hp {
             self.parse_dot_packet(packet);
@@ -371,6 +372,63 @@ impl StreamProcessor {
         self.data_storage.note_map_load(map_id);
     }
 
+    // ===== FIELD BOSS LIST (01 91) =====
+
+    /// `<len> 01 91 <u16> <u32 map id> <count varint> <record>*`: the map's
+    /// field boss list, sent about once a second while the map is open.
+    ///
+    /// A record is `<alive u8> <spawn id varint> [<position>] <u64 unix ms>`.
+    /// Dead: the time is the respawn. Alive: the time is when it spawned, after
+    /// three f32 coordinates and sometimes one more byte (12 or 13 bytes, not
+    /// decoded), so the time is found where it reads as plausible. Spawn ids are
+    /// the map id and a number (map 1110: 111001..111024). Worked out from a
+    /// capture of 2026-10-11 against the in-game list.
+    fn parse_field_boss_list_packet(&self, packet: &[u8]) {
+        let length_info = read_varint(packet, 0);
+        if length_info.length <= 0 {
+            return;
+        }
+        let offset = length_info.length as usize;
+        if offset + 9 > packet.len() || packet[offset] != 0x01 || packet[offset + 1] != 0x91 {
+            return;
+        }
+        let map_id = parse_u32_le(packet, offset + 4) as i32;
+        let count = read_varint(packet, offset + 8);
+        if map_id <= 0 || count.length <= 0 || !(1..=200).contains(&count.value) {
+            return;
+        }
+        let plausible_ms = |at: usize| -> Option<i64> {
+            let bytes: [u8; 8] = packet.get(at..at + 8)?.try_into().ok()?;
+            let ms = i64::from_le_bytes(bytes);
+            (1_600_000_000_000..4_000_000_000_000).contains(&ms).then_some(ms)
+        };
+        let mut pos = offset + 8 + count.length as usize;
+        let mut bosses = Vec::with_capacity(count.value as usize);
+        for _ in 0..count.value {
+            let Some(&alive) = packet.get(pos) else { return };
+            if alive > 1 {
+                return;
+            }
+            let id = read_varint(packet, pos + 1);
+            if id.length <= 0 || id.value / 100 != map_id {
+                return;
+            }
+            let after_id = pos + 1 + id.length as usize;
+            let skips: &[usize] = if alive == 1 { &[12, 13] } else { &[0] };
+            let Some((skip, ms)) = skips.iter().find_map(|&skip| {
+                let ms = plausible_ms(after_id + skip)?;
+                // The next record (or the trailing padding) starts with 0 or 1.
+                let next = packet.get(after_id + skip + 8).copied().unwrap_or(0);
+                (next <= 1).then_some((skip, ms))
+            }) else {
+                return;
+            };
+            bosses.push((id.value, alive == 1, ms));
+            pos = after_id + skip + 8;
+        }
+        self.data_storage.note_field_bosses(&bosses);
+    }
+
     // ===== DEATH PACKET (41 36) =====
 
     fn parse_death_packet(&self, packet: &[u8]) {
@@ -415,6 +473,14 @@ impl StreamProcessor {
         if flag_info.value == 3 {
             tracing::trace!("Death event: entity {} killed in combat", entity_id);
             self.data_storage.mark_entity_dead(entity_id);
+            // Live kills only: a replay's deaths are not happening now.
+            if self.override_timestamp.is_none() && !crate::clock::is_overridden() {
+                if let Some(code) = self.data_storage.mob_code(entity_id) {
+                    if self.npc_lookup.is_boss(code) {
+                        self.data_storage.note_boss_kill(code, crate::clock::now_ms());
+                    }
+                }
+            }
         }
         // Only under the current opcode: under the old one (`41 36`, now the
         // spawn) a summon's spawn mask can read as flag 7.
@@ -3929,5 +3995,37 @@ mod tests {
         let mut garbled = record.clone();
         garbled[13] = 0x07;
         assert!(!processor.scan_for_embedded_04_8d(&garbled));
+    }
+    /// The map's field boss list (01 91) as captured on 2026-10-11 on map 1110,
+    /// 24 bosses; the in-game list then showed Immortal Gartua (111021) with
+    /// 3h 39m 12s left at the capture's 18:38:52 CEST.
+    #[test]
+    fn the_field_boss_list_gives_each_boss_its_time() {
+        let hex = [
+            "019100005604000018019be306544326c84e308ac600f4bc46fd8ddb8e2ba101000000ace30690a8c12ca10100000199",
+            "e30691939bc7645092c700ecdd460bf5bb2ba1010000019ae306325c15c89ed7dcc700f909473f97ba2ba101000001a2",
+            "e306000c7e47005230c80058bd455bb7b12ba1010000019ce3061dbc2fc8d56a96c50002c546ab6ea22ba101000001a9",
+            "e306e0d4d34713801d4800c8d145e700972ba1010000019ee30600d004c7005a204700207e468791f52aa1010000019d",
+            "e306da1467c51152204700fc64463d8107362ba101000000a0e3066161312ca1010000019fe3069c2a94466b3f02c700",
+            "1c3146ecd8bf2ba101000001a1e30600a57447800a0dc800f0db455adba32aa101000001a3e306ee710b48dd27d9c700",
+            "409546768fa92ba101000001a4e306413f42482dc5e5c700b69746b6f50e2ba101000000a7e3062e38382ca101000000",
+            "a5e30692bc742ca101000001a6e306afe0f7471d71fb460040e444091321812ba101000000a8e3068437c92ca1010000",
+            "00aae3063cb81e2ca101000001abe30638429fc511181a480088a9c51397572ba101000000ade3060d899d2ca1010000",
+            "00aee306cff0a82ca101000000afe3066d5df32ba101000000b0e30628f1df2ba1010000000000",
+        ].concat();
+        let body: Vec<u8> = (0..hex.len() / 2).map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).unwrap()).collect();
+        let mut packet = vec![0xDB, 0x03]; // length varint (value unused)
+        packet.extend_from_slice(&body);
+        let (storage, processor) = processor();
+        processor.parse_field_boss_list_packet(&packet);
+        let bosses = storage.take_field_bosses_if_changed().expect("parsed");
+        assert_eq!(bosses.len(), 24);
+        // Gartua: dead, back at 2026-10-11 22:18:04 CEST.
+        let (alive, ms) = bosses[&111021];
+        assert!(!alive);
+        assert_eq!(ms / 1000, 1_791_749_884);
+        // Alive bosses' records are 24 or 25 bytes; both kinds parse.
+        assert!(bosses[&111003].0 && bosses[&111005].0 && bosses[&111014].0 && bosses[&111001].0);
+        assert!(storage.take_field_bosses_if_changed().is_none());
     }
 }

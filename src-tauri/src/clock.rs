@@ -32,6 +32,11 @@ pub fn set_override(ms: Option<i64>) {
     OVERRIDE_MS.with(|c| c.set(ms));
 }
 
+/// Whether this thread is replaying, its clock pinned to capture timestamps.
+pub fn is_overridden() -> bool {
+    OVERRIDE_MS.with(|c| c.get()).is_some()
+}
+
 /// Milliseconds since the Unix epoch — the capture timestamp while replaying,
 /// otherwise the wall clock.
 pub fn now_ms() -> i64 {

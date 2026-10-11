@@ -567,6 +567,13 @@ fn get_settings(state: tauri::State<'_, AppState>) -> std::collections::HashMap<
 /// The All Targets time range (Settings), in milliseconds.
 const ALL_TARGETS_WINDOW_KEY: &str = "dpsMeter.allTargetsWindowMs";
 
+/// NPC codes (comma-separated) whose kills the Timers panel tracks.
+const TIMERS_TRACKED_KEY: &str = "timers.trackedCodes";
+/// Prefix of the setting holding a tracked boss's last kill time (unix ms).
+const TIMERS_KILL_PREFIX: &str = "timers.kill.";
+/// The field boss list from the in-game map, as JSON (see the DPS tick).
+const TIMERS_FIELD_BOSSES_KEY: &str = "timers.fieldBosses";
+
 fn apply_all_targets_window(state: &AppState, value: &str) {
     if let Ok(ms) = value.trim().parse::<i64>() {
         state.dps_calculator.lock().set_all_targets_window_ms(ms);
@@ -2790,6 +2797,44 @@ pub fn run() {
 
                         if let Some(ping) = state.ping_tracker.current_ping_ms() {
                             let _ = handle.emit("ping-update", ping);
+                        }
+
+                        // Kills of bosses the Timers panel tracks start their
+                        // respawn countdowns; kept as settings so they survive
+                        // a restart, and broadcast like any setting change.
+                        // The map's field boss list, merged into what earlier
+                        // runs and other maps saw: `{ spawnId: [alive, unixMs, seenMs] }`.
+                        if let Some(bosses) = state.data_storage.take_field_bosses_if_changed() {
+                            let mut saved: serde_json::Map<String, serde_json::Value> = state
+                                .settings
+                                .get(TIMERS_FIELD_BOSSES_KEY)
+                                .and_then(|s| serde_json::from_str(&s).ok())
+                                .unwrap_or_default();
+                            let seen = crate::clock::now_ms();
+                            for (id, (alive, ms)) in bosses {
+                                saved.insert(id.to_string(), serde_json::json!([alive, ms, seen]));
+                            }
+                            let key = TIMERS_FIELD_BOSSES_KEY.to_string();
+                            let value = serde_json::Value::Object(saved).to_string();
+                            if state.settings.set(&key, &value) {
+                                let _ = handle.emit("setting-changed", serde_json::json!({ "key": key, "value": value }));
+                            }
+                        }
+
+                        let kills = state.data_storage.take_boss_kills();
+                        if !kills.is_empty() {
+                            let tracked = state.settings.get(TIMERS_TRACKED_KEY).unwrap_or_default();
+                            for (code, unix_ms) in kills {
+                                if !tracked.split(',').any(|c| c.trim() == code.to_string()) {
+                                    continue;
+                                }
+                                let key = format!("{TIMERS_KILL_PREFIX}{code}");
+                                let value = unix_ms.to_string();
+                                tracing::info!("Timers: tracked boss {code} killed at {unix_ms}");
+                                if state.settings.set(&key, &value) {
+                                    let _ = handle.emit("setting-changed", serde_json::json!({ "key": key, "value": value }));
+                                }
+                            }
                         }
 
                         // --- Auto-hide when AION2 loses focus (every tick) ---

@@ -2896,6 +2896,11 @@ class DpsApp {
 
     this.initializeSettingsDropdowns();
 
+    // Quits like the tray's Quit: saves the fight history first.
+    document.querySelector(".closeBtn")?.addEventListener("click", () => {
+      window.javaBridge?.exitApp?.();
+    });
+
     this.settingsBtn?.addEventListener("click", () => {
       // Settings is its own window now, so the overlay no longer grows to
       // ~820px to contain it.

@@ -648,6 +648,71 @@ fn remember_window(app: &tauri::AppHandle, id: &str, state: Option<&str>) {
     settings.settings.set(WINDOWS_KEY, &Value::Object(windows).to_string());
 }
 
+/// Where a plugin window was last left, `"x,y"` (physical pixels), per id.
+const POSITION_PREFIX: &str = "dpsMeter.pluginWindow.";
+
+fn saved_position(app: &tauri::AppHandle, id: &str) -> Option<(i32, i32)> {
+    let value = app.try_state::<AppState>()?.settings.get(&format!("{POSITION_PREFIX}{id}"))?;
+    let (x, y) = value.split_once(',')?;
+    Some((x.trim().parse().ok()?, y.trim().parse().ok()?))
+}
+
+/// When each plugin window was last shown: moves right after that are the
+/// window manager placing it, not the user.
+fn shown_at() -> &'static Mutex<HashMap<String, Instant>> {
+    static SHOWN: std::sync::OnceLock<Mutex<HashMap<String, Instant>>> = std::sync::OnceLock::new();
+    SHOWN.get_or_init(Mutex::default)
+}
+
+/// Show a plugin window where it was last left. KWin places a window anew
+/// each time it is mapped (centred, 2026-10-12), so the position is set
+/// before showing and again once it is up.
+fn show_in_place(app: &tauri::AppHandle, window: &tauri::WebviewWindow, id: &str, show: impl FnOnce()) {
+    shown_at().lock().unwrap_or_else(|p| p.into_inner()).insert(id.to_string(), Instant::now());
+    let saved = saved_position(app, id);
+    if let Some((x, y)) = saved {
+        let _ = window.set_position(tauri::PhysicalPosition::new(x, y));
+    }
+    show();
+    if let Some((x, y)) = saved {
+        let window = window.clone();
+        tauri::async_runtime::spawn(async move {
+            for wait in [40, 120, 250] {
+                tokio::time::sleep(Duration::from_millis(wait)).await;
+                let _ = window.set_position(tauri::PhysicalPosition::new(x, y));
+            }
+        });
+    }
+}
+
+/// A plugin window moved: remember where, once it has stopped moving.
+/// Ignored while the window is being shown (see `show_in_place`).
+pub fn note_moved(app: &tauri::AppHandle, label: &str, at: tauri::PhysicalPosition<i32>) {
+    static LATEST: std::sync::OnceLock<Mutex<HashMap<String, (i32, i32)>>> = std::sync::OnceLock::new();
+    let Some(id) = label.strip_prefix("plugin-").filter(|id| valid_id(id)).map(str::to_string) else { return };
+    let placing = shown_at()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(&id)
+        .is_some_and(|t| t.elapsed() < Duration::from_millis(700));
+    if placing {
+        return;
+    }
+    let latest = LATEST.get_or_init(Mutex::default);
+    let first = latest.lock().unwrap_or_else(|p| p.into_inner()).insert(id.clone(), (at.x, at.y)).is_none();
+    if !first {
+        return;
+    }
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        let Some((x, y)) = latest.lock().unwrap_or_else(|p| p.into_inner()).remove(&id) else { return };
+        if let Some(state) = app.try_state::<AppState>() {
+            state.settings.set(&format!("{POSITION_PREFIX}{id}"), &format!("{x},{y}"));
+        }
+    });
+}
+
 /// Build (or show) a plugin's window; `visible: false` builds it hidden, for a
 /// plugin restored at start that was watching in the background.
 fn open_window(app: &tauri::AppHandle, id: &str, visible: bool) -> Result<(), String> {
@@ -664,7 +729,9 @@ fn open_window(app: &tauri::AppHandle, id: &str, visible: bool) -> Result<(), St
     let label = format!("plugin-{id}");
     if let Some(window) = app.get_webview_window(&label) {
         if visible {
-            let _ = window.show();
+            show_in_place(app, &window, id, || {
+                let _ = window.show();
+            });
             let _ = window.set_focus();
         }
         return Ok(());
@@ -684,7 +751,11 @@ fn open_window(app: &tauri::AppHandle, id: &str, visible: bool) -> Result<(), St
         // window): the page draws its own edge, which fades with the panel.
         .shadow(false)
         .build()
-        .map(|_| ())
+        .map(|window| {
+            if let Some((x, y)) = saved_position(app, id) {
+                let _ = window.set_position(tauri::PhysicalPosition::new(x, y));
+            }
+        })
         .map_err(|e| e.to_string())
 }
 
@@ -719,7 +790,7 @@ pub fn plugin_window(app: tauri::AppHandle, window: tauri::WebviewWindow, visibl
     let id = window_plugin(&window)?;
     require(&app, &id, "window")?;
     if visible {
-        crate::platform::window::show_on_top_without_focus(&window);
+        show_in_place(&app, &window, &id, || crate::platform::window::show_on_top_without_focus(&window));
     } else {
         let _ = window.hide();
     }

@@ -68,6 +68,8 @@
   const KEY_TRACKED = "timers.trackedCodes";
   const KEY_KILL = "timers.kill.";
   const KEY_MUTED = "timers.muted";
+  const KEY_CUBE_ALERT = "timers.cubeAlert"; // read by the backend
+  const KEY_CUBES = "timers.cubes"; // { since: [unix ms…], newAt }, set by the backend
   const KEY_OPEN = "timers.panelOpen";
   const KEY_LEAD = "timers.leadMin";
   const KEY_ALERT_BEFORE = "timers.alertBefore";
@@ -265,7 +267,9 @@
     const remove = () => row.remove();
     row.addEventListener("click", remove);
     alerts.prepend(row);
-    while (alerts.children.length > 3) alerts.lastChild.remove();
+    // Three at most, not counting the Hidden Cube banner, which stays.
+    const timed = [...alerts.children].filter((el) => !el.classList.contains("timerCube"));
+    timed.slice(3).forEach((el) => el.remove());
     setTimeout(remove, 20_000);
     beep();
   };
@@ -298,6 +302,9 @@
       <label><input type="checkbox" class="timersAlertBefore" /> Before:</label>
       <input type="number" class="timersLead" min="1" max="120" step="1" /> min
       <label><input type="checkbox" class="timersAlertStart" /> At start</label>
+    </div>
+    <div class="timersAlertSettings" data-no-drag>
+      <label><input type="checkbox" class="timersCubeAlert" /> Hidden Cube nearby</label>
     </div>`;
   window.lucide?.createIcons?.({ root: panel });
   const bossList = panel.querySelector(".timersBosses");
@@ -308,6 +315,7 @@
   const syncAlertSettings = () => {
     alertBeforeBox.checked = flagSetting(KEY_ALERT_BEFORE);
     alertStartBox.checked = flagSetting(KEY_ALERT_START);
+    cubeBox.checked = flagSetting(KEY_CUBE_ALERT);
     if (document.activeElement !== leadInput) leadInput.value = String(leadMinutes());
     leadInput.disabled = !alertBeforeBox.checked;
   };
@@ -316,6 +324,8 @@
     syncAlertSettings();
   });
   alertStartBox.addEventListener("change", () => bridge.setSetting(KEY_ALERT_START, String(alertStartBox.checked)));
+  const cubeBox = panel.querySelector(".timersCubeAlert");
+  cubeBox.addEventListener("change", () => bridge.setSetting(KEY_CUBE_ALERT, String(cubeBox.checked)));
   leadInput.addEventListener("change", () => {
     const minutes = Math.round(Number(leadInput.value));
     if (minutes >= 1 && minutes <= 120) bridge.setSetting(KEY_LEAD, String(minutes));
@@ -427,6 +437,61 @@
       }
     }
     if (fired.size > 500) fired.clear();
+    renderCubes(now);
+  };
+
+  // ---- Hidden Cubes ----------------------------------------------------------
+
+  // A banner that stays while a Hidden Cube is in range: the backend drops a
+  // cube when it is looted or out of range. A click hides it until a cube
+  // comes (back) into range. It beeps only for a cube never seen before.
+  const cubeRow = document.createElement("div");
+  cubeRow.className = "timerAlert timerCube";
+  cubeRow.dataset.noDrag = "";
+  cubeRow.title = "Dismiss";
+  let cubesDismissedAt = 0;
+  let cubeBeepedAt = null;
+  cubeRow.addEventListener("click", () => {
+    cubesDismissedAt = Date.now();
+    cubeRow.remove();
+  });
+  const cubesState = () => {
+    try {
+      const state = JSON.parse(bridge.getSetting(KEY_CUBES) || "{}");
+      return {
+        since: Array.isArray(state.since) ? state.since : [],
+        dist: Array.isArray(state.dist) ? state.dist : [],
+        posAt: Number(state.posAt) || 0,
+        newAt: Number(state.newAt) || 0,
+      };
+    } catch (_) {
+      return { since: [], dist: [], posAt: 0, newAt: 0 };
+    }
+  };
+  const renderCubes = (now) => {
+    const { since, dist, posAt, newAt } = cubesState();
+    // What was already known when the meter started is not news.
+    if (cubeBeepedAt == null) cubeBeepedAt = newAt;
+    const show = since.some((t) => t > cubesDismissedAt);
+    if (!show) {
+      cubeRow.remove();
+      return;
+    }
+    const count = since.length > 1 ? `${since.length} Hidden Cubes nearby` : "Hidden Cube nearby";
+    // Distance from where the server last said you were: every few seconds
+    // while you move, so say how old it is once that matters.
+    const known = dist.filter((d) => typeof d === "number");
+    let away = "";
+    if (known.length) {
+      away = ` · ${since.length > 1 ? "nearest " : ""}~${Math.min(...known)} m`;
+      if (posAt && now - posAt > 15_000) away += ` (as of ${countdown(now - posAt)} ago)`;
+    }
+    cubeRow.textContent = `${count}${away} · in range for ${countdown(now - Math.min(...since))}`;
+    if (!cubeRow.isConnected) alerts.prepend(cubeRow);
+    if (newAt > cubeBeepedAt) {
+      cubeBeepedAt = newAt;
+      if (now - newAt < MINUTE) beep();
+    }
   };
 
   const render = (now) => {

@@ -82,6 +82,9 @@ fn run(app: tauri::AppHandle) {
     let mut shown: Option<Shown> = None;
     let mut game_since: Option<i64> = None;
     let mut last_scan: Option<Instant> = None;
+    // Gear score is only known while in a party: keep the last one seen for
+    // the same character after the party ends.
+    let mut last_gear: Option<(String, i32)> = None;
     loop {
         std::thread::sleep(TICK);
         let Some(state) = app.try_state::<AppState>() else { continue };
@@ -102,7 +105,7 @@ fn run(app: tauri::AppHandle) {
 
         let lang = state.settings.get("dpsMeter.language").unwrap_or_else(|| "en".into());
         let text = Texts::load(state.i18n_data_dir.as_ref(), &lang);
-        let next = describe(&state.data_storage, &state, &text, &lang);
+        let next = describe(&state.data_storage, &state, &text, &lang, &mut last_gear);
 
         // A Discord started after the game is picked up on a later scan, and
         // told the current activity even when it has not changed.
@@ -316,8 +319,15 @@ fn class_key(class: JobClass) -> &'static str {
     }
 }
 
-fn describe(storage: &Arc<DataStorage>, state: &AppState, text: &Texts, lang: &str) -> Shown {
+fn describe(
+    storage: &Arc<DataStorage>,
+    state: &AppState,
+    text: &Texts,
+    lang: &str,
+    last_gear: &mut Option<(String, i32)>,
+) -> Shown {
     let profile = storage.local_profile();
+    let gear_score = remembered_gear_score(&profile, last_gear);
     let class_name = profile.class.map(|c| text.class(c));
     let mut details: Vec<String> = Vec::new();
     if let Some(name) = &class_name {
@@ -326,10 +336,20 @@ fn describe(storage: &Arc<DataStorage>, state: &AppState, text: &Texts, lang: &s
     if let Some(level) = profile.level {
         details.push(text.get("level", "Lv {level}").replace("{level}", &level.to_string()));
     }
+    if let Some(gs) = gear_score {
+        details.push(text.get("gearScore", "GS {gs}").replace("{gs}", &gs.to_string()));
+    }
     let class_line = if details.is_empty() { text.get("inGame", "In game") } else { details.join(" · ") };
-    // The character's name leads: "Naicha · Cleric · Lv 30".
+    // The character's name leads: "Naicha · Cleric · Lv 30". With a gear
+    // score the class gives way to it ("Naicha · Lv 30 · GS 1520"): the
+    // profile popout cuts the line at about 30 characters, and the class
+    // icon beside it (hover: class, level and gear score) already says it.
+    let short_line = match (&class_name, gear_score) {
+        (Some(_), Some(_)) if details.len() > 1 => details[1..].join(" · "),
+        _ => class_line.clone(),
+    };
     let details = match profile.name.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
-        Some(name) => format!("{name} · {class_line}"),
+        Some(name) => format!("{name} · {short_line}"),
         None => class_line.clone(),
     };
 
@@ -345,6 +365,17 @@ fn describe(storage: &Arc<DataStorage>, state: &AppState, text: &Texts, lang: &s
         class_key: profile.class.map(class_key),
         class_name,
     }
+}
+
+/// This character's gear score: the roster's when in a party, else the last
+/// one the roster gave for the same character.
+fn remembered_gear_score(profile: &LocalProfile, last: &mut Option<(String, i32)>) -> Option<i32> {
+    let name = profile.name.as_deref().map(str::trim).filter(|n| !n.is_empty())?;
+    if let Some(gs) = profile.gear_score {
+        *last = Some((name.to_string(), gs));
+        return Some(gs);
+    }
+    last.as_ref().filter(|(n, _)| n == name).map(|(_, gs)| *gs)
 }
 
 /// The boss being fought right now, by name, if any.
@@ -510,6 +541,17 @@ mod tests {
         assert_eq!(in_dungeon(600012, Some(&dir), &texts(), "en").as_deref(), Some("Urugugu Canyon · Conquest (Normal)"));
         assert_eq!(in_dungeon(600091, Some(&dir), &texts(), "en").as_deref(), Some("Ferocious Horn Den · Expedition"));
         assert_eq!(in_dungeon(0, Some(&dir), &texts(), "en"), None);
+    }
+
+    #[test]
+    fn the_gear_score_outlives_the_party_for_the_same_character() {
+        let mut last = None;
+        let in_party = LocalProfile { name: Some("Naicha".into()), gear_score: Some(1520), ..Default::default() };
+        assert_eq!(remembered_gear_score(&in_party, &mut last), Some(1520));
+        let solo = LocalProfile { name: Some("Naicha".into()), ..Default::default() };
+        assert_eq!(remembered_gear_score(&solo, &mut last), Some(1520));
+        let other = LocalProfile { name: Some("Alt".into()), ..Default::default() };
+        assert_eq!(remembered_gear_score(&other, &mut last), None);
     }
 
     #[test]

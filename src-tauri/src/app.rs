@@ -573,6 +573,13 @@ const TIMERS_TRACKED_KEY: &str = "timers.trackedCodes";
 const TIMERS_KILL_PREFIX: &str = "timers.kill.";
 /// The field boss list from the in-game map, as JSON (see the DPS tick).
 const TIMERS_FIELD_BOSSES_KEY: &str = "timers.fieldBosses";
+/// Whether Hidden Cubes nearby raise the meter's cube banner ("false": off).
+const TIMERS_CUBE_ALERT_KEY: &str = "timers.cubeAlert";
+/// The Hidden Cubes in range, for the Timers panel's banner:
+/// `{"since": [unix ms each came into range], "dist": [metres from your last
+/// known position, or null], "posAt": when that position was stated,
+/// "newAt": unix ms of the last never-seen-before one}`.
+const TIMERS_CUBES_KEY: &str = "timers.cubes";
 
 fn apply_all_targets_window(state: &AppState, value: &str) {
     if let Ok(ms) = value.trim().parse::<i64>() {
@@ -2241,6 +2248,48 @@ fn debug_status(state: tauri::State<'_, AppState>) -> serde_json::Value {
     })
 }
 
+/// Settings' "Test" for the Hidden Cube alert: a real cube record (`34 36`,
+/// from the 2026-10-11 23:53 capture), framed like the game's stream and read by a packet
+/// reader exactly as live traffic is, so detection, the in-range list, the
+/// banner and the beep all run as for a real cube. The banner is not raised
+/// directly. A removal record follows after 30 s, as if walking out of range.
+/// Entity 65535 (`ff ff 03`), and a fresh x each time so every test is a new cube.
+#[tauri::command]
+async fn simulate_hidden_cube(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    use crate::capture::stream_processor::StreamProcessor;
+    fn frame(body: &[u8]) -> Vec<u8> {
+        let mut len = crate::capture::framing::length_value(body.len());
+        let mut out = Vec::with_capacity(body.len() + 3);
+        loop {
+            let byte = (len & 0x7f) as u8;
+            len >>= 7;
+            out.push(if len > 0 { byte | 0x80 } else { byte });
+            if len == 0 { break; }
+        }
+        out.extend_from_slice(body);
+        out
+    }
+    let hex = |h: &str| -> Vec<u8> { (0..h.len()).step_by(2).filter_map(|i| u8::from_str_radix(&h[i..i + 2], 16).ok()).collect() };
+    let mut spawn = hex(concat!(
+        "3436ffff030400cfda1300d529c7c7909099c7003b044700000000000000000101014373f42ca1",
+        "0100000000000000000000471751c6070000",
+    ));
+    // A fresh x each time, so every test is a new cube.
+    spawn[11..15].copy_from_slice(&((crate::clock::now_ms() % 100_000) as f32 - 150_000.0).to_le_bytes());
+    let gone = hex("3536ffff03040300");
+
+    let new_reader = || StreamProcessor::new(state.data_storage.clone(), state.skill_lookup.clone(), state.npc_lookup.clone());
+    tracing::info!("Hidden Cube test: feeding a cube spawn record to the packet reader");
+    new_reader().consume_stream(&frame(&spawn));
+    let (storage, skills, npcs) = (state.data_storage.clone(), state.skill_lookup.clone(), state.npc_lookup.clone());
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        tracing::info!("Hidden Cube test: feeding its removal record");
+        StreamProcessor::new(storage, skills, npcs).consume_stream(&frame(&gone));
+    });
+    Ok(())
+}
+
 #[tauri::command]
 async fn replay_file(state: tauri::State<'_, AppState>, file_path: String) -> Result<String, String> {
     // Reset existing data before replay
@@ -2821,6 +2870,59 @@ pub fn run() {
                             }
                         }
 
+                        // Hidden Cubes in range, for the meter's banner. `newAt`
+                        // moves only for a cube never seen before, so the beep
+                        // does not repeat along the edge of its range.
+                        // Cubes from before a restart are not in range any more.
+                        if tick_count == 1 {
+                            let saved = state.settings.get(TIMERS_CUBES_KEY)
+                                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
+                            if saved.as_ref().is_some_and(|v| v["since"].as_array().is_some_and(|a| !a.is_empty())) {
+                                let new_at = saved.and_then(|v| v["newAt"].as_i64()).unwrap_or(0);
+                                let key = TIMERS_CUBES_KEY.to_string();
+                                let value = serde_json::json!({ "since": [], "newAt": new_at }).to_string();
+                                if state.settings.set(&key, &value) {
+                                    let _ = handle.emit("setting-changed", serde_json::json!({ "key": key, "value": value }));
+                                }
+                            }
+                        }
+                        let new_cube = state.data_storage.take_cube_spawn();
+                        if let Some(cubes) = state.data_storage.take_cubes_in_range_if_changed() {
+                            if new_cube.is_some() {
+                                tracing::info!("Timers: Hidden Cubes in range: {} (new one)", cubes.len());
+                            }
+                            let enabled = state.settings.get(TIMERS_CUBE_ALERT_KEY).as_deref() != Some("false");
+                            let cubes = if enabled { cubes } else { Vec::new() };
+                            // Distance in metres (world units are centimetres)
+                            // from your last stated position.
+                            let me = state.data_storage.own_position();
+                            let dist: Vec<serde_json::Value> = cubes
+                                .iter()
+                                .map(|(_, at)| match me {
+                                    Some((pos, _)) => {
+                                        let d = ((pos[0] - at[0]).powi(2) + (pos[1] - at[1]).powi(2) + (pos[2] - at[2]).powi(2)).sqrt();
+                                        serde_json::json!((d / 100.0).round())
+                                    }
+                                    None => serde_json::Value::Null,
+                                })
+                                .collect();
+                            let new_at = new_cube.or_else(|| {
+                                state.settings.get(TIMERS_CUBES_KEY)
+                                    .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                                    .and_then(|v| v["newAt"].as_i64())
+                            });
+                            let key = TIMERS_CUBES_KEY.to_string();
+                            let value = serde_json::json!({
+                                "since": cubes.iter().map(|c| c.0).collect::<Vec<_>>(),
+                                "dist": dist,
+                                "posAt": me.map(|(_, t)| t),
+                                "newAt": new_at.unwrap_or(0),
+                            }).to_string();
+                            if state.settings.set(&key, &value) {
+                                let _ = handle.emit("setting-changed", serde_json::json!({ "key": key, "value": value }));
+                            }
+                        }
+
                         let kills = state.data_storage.take_boss_kills();
                         if !kills.is_empty() {
                             let tracked = state.settings.get(TIMERS_TRACKED_KEY).unwrap_or_default();
@@ -3131,6 +3233,7 @@ pub fn run() {
             get_available_devices,
             set_manual_device,
             replay_file,
+            simulate_hidden_cube,
             test_auto_hide,
             fetch_url,
             show_update_window,

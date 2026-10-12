@@ -266,6 +266,9 @@ pub struct LocalProfile {
     pub server_id: u16,
     pub class: Option<JobClass>,
     pub level: Option<u32>,
+    /// Equipment item level: your own entry in the party roster, else the last
+    /// self record's.
+    pub gear_score: Option<i32>,
 }
 
 /// One entry of the party roster packet (`0x9702`). Keyed by character name,
@@ -558,6 +561,18 @@ struct Inner {
     /// The class and level your own self record last stated, with the name it
     /// was for, so a character switch does not carry the last one's over.
     self_profile: Option<(String, Option<JobClass>, Option<u32>)>,
+    /// Hidden Cubes seen spawning, by (entity id, position bits), with when:
+    /// one comes back each time you re-enter its range and must not alert twice.
+    seen_cubes: HashMap<(i32, u32), i64>,
+    /// When the newest not-yet-reported cube appeared (unix ms).
+    pending_cube: Option<i64>,
+    /// Hidden Cubes in range now: entity id -> (when it came into range, where).
+    cubes_in_range: HashMap<i32, (i64, [f32; 3])>,
+    cubes_dirty: bool,
+    /// Your last known position and when it was stated (see `note_own_position`).
+    own_position: Option<([f32; 3], i64)>,
+    /// The gear score the last self record gave, with the name it was for.
+    self_gear_score: Option<(String, i32)>,
 }
 
 #[derive(Default)]
@@ -637,6 +652,12 @@ impl DataStorage {
                 player_servers: HashMap::new(),
                 self_server: 0,
                 self_profile: None,
+                self_gear_score: None,
+                seen_cubes: HashMap::new(),
+                pending_cube: None,
+                cubes_in_range: HashMap::new(),
+                cubes_dirty: false,
+                own_position: None,
             }),
             damage_generation: AtomicI64::new(0),
             last_damage_ms: AtomicI64::new(NEVER_MS),
@@ -1023,6 +1044,12 @@ impl DataStorage {
         inner.self_profile = Some((name.to_string(), class.or(old_class), level.or(old_level)));
     }
 
+    /// Your gear score as the self record states it (sent on login and on
+    /// every teleport).
+    pub fn note_self_gear_score(&self, name: &str, gear_score: i32) {
+        self.inner.write().self_gear_score = Some((name.to_string(), gear_score));
+    }
+
     /// Who you are playing, as far as the game has said: name, server, class
     /// and level. Class falls back to the one your skills show, for a meter
     /// started before the self record came; level has no such fallback.
@@ -1040,7 +1067,17 @@ impl DataStorage {
         if class.is_none() {
             class = inner.local_player_id.and_then(|id| inner.actor_jobs.get(&(id as i32)).copied());
         }
-        LocalProfile { name, server_id: server, class, level }
+        // The roster's is the fresher while in a party (it follows gear
+        // changes); the self record's is from the last teleport.
+        let gear_score = name.as_deref().map(str::trim).and_then(|n| {
+            inner
+                .party_members
+                .get(n)
+                .map(|m| m.gear_score)
+                .filter(|&g| g > 0)
+                .or_else(|| inner.self_gear_score.as_ref().filter(|(sn, _)| sn.trim() == n).map(|(_, g)| *g))
+        });
+        LocalProfile { name, server_id: server, class, level, gear_score }
     }
 
     /// The server the fights being recorded are on: the local player's home
@@ -1319,6 +1356,76 @@ impl DataStorage {
         if inner.pending_boss_kills.len() < 64 {
             inner.pending_boss_kills.push((code, unix_ms));
         }
+    }
+
+    /// A Hidden Cube spawned near you (`key`: its entity id and position, so
+    /// the same cube coming back into range is not new).
+    pub fn note_cube_spawn(&self, key: (i32, u32), pos: [f32; 3], unix_ms: i64) {
+        let mut inner = self.inner.write();
+        inner.seen_cubes.retain(|_, &mut t| unix_ms - t < 2 * 60 * 60 * 1000);
+        if inner.seen_cubes.insert(key, unix_ms).is_none() {
+            inner.pending_cube = Some(unix_ms);
+        }
+        inner.cubes_in_range.insert(key.0, (unix_ms, pos));
+        inner.cubes_dirty = true;
+    }
+
+    /// An entity left: looted, or out of range (the game sends the same
+    /// `42 36 <id> 00 01` for both). Only matters if it was a cube.
+    pub fn note_cube_gone(&self, entity_id: i32) {
+        if !self.inner.read().cubes_in_range.contains_key(&entity_id) {
+            return;
+        }
+        let mut inner = self.inner.write();
+        if inner.cubes_in_range.remove(&entity_id).is_some() {
+            tracing::info!("Hidden Cube {entity_id} gone (looted or out of range)");
+            inner.cubes_dirty = true;
+        }
+    }
+
+    /// A teleport leaves the cubes behind, but not one seen in the last few
+    /// seconds: the new area's spawns can arrive just before the teleport's
+    /// own record (a cube 0.5 s after the self record was wiped, 2026-10-11).
+    pub fn clear_cubes_in_range(&self, unix_ms: i64) {
+        let mut inner = self.inner.write();
+        let before = inner.cubes_in_range.len();
+        inner.cubes_in_range.retain(|_, &mut (since, _)| unix_ms - since < 5_000);
+        if inner.cubes_in_range.len() != before {
+            inner.cubes_dirty = true;
+        }
+    }
+
+    /// The cubes in range, (when each came into range, where), oldest first,
+    /// if they or your position changed since the last call.
+    pub fn take_cubes_in_range_if_changed(&self) -> Option<Vec<(i64, [f32; 3])>> {
+        let mut inner = self.inner.write();
+        if !inner.cubes_dirty {
+            return None;
+        }
+        inner.cubes_dirty = false;
+        let mut cubes: Vec<(i64, [f32; 3])> = inner.cubes_in_range.values().copied().collect();
+        cubes.sort_unstable_by_key(|c| c.0);
+        Some(cubes)
+    }
+
+    /// Where you are, as the server last said: the `2a38` records about you
+    /// (every few seconds while moving), your mantra ticks (`2b38`, once a
+    /// second while one runs) and a teleport's destination.
+    pub fn note_own_position(&self, pos: [f32; 3], unix_ms: i64) {
+        let mut inner = self.inner.write();
+        inner.own_position = Some((pos, unix_ms));
+        if !inner.cubes_in_range.is_empty() {
+            inner.cubes_dirty = true;
+        }
+    }
+
+    pub fn own_position(&self) -> Option<([f32; 3], i64)> {
+        self.inner.read().own_position
+    }
+
+    /// When a new Hidden Cube appeared, once per cube.
+    pub fn take_cube_spawn(&self) -> Option<i64> {
+        self.inner.write().pending_cube.take()
     }
 
     /// The map's field boss list arrived: (spawn id, alive, unix ms) each.

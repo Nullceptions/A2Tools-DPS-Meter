@@ -79,6 +79,7 @@ class DpsApp {
       theme: "dpsMeter.theme",
       slimMode: "dpsMeter.slimMode",
       autoHideMeter: "dpsMeter.autoHideMeter",
+      globalHotkeys: "dpsMeter.globalHotkeys",
       bossLogs: "dpsMeter.bossLogsEnabled",
       saveRawPackets: "dpsMeter.saveRawPackets",
       autoUpload: "dpsMeter.autoUpload",
@@ -239,6 +240,13 @@ class DpsApp {
     if (saved === "false") return false;
     if (saved === "true") return true;
     return !this.safeGetSetting("dpsMeter.manualDevice");
+  }
+
+  // Whether keybinds are on: the saved choice, else this OS's default.
+  globalHotkeysOn() {
+    const stored = this.safeGetSetting(this.storageKeys.globalHotkeys);
+    if (stored === "true" || stored === "false") return stored === "true";
+    return !document.documentElement?.classList?.contains?.("linux");
   }
 
   safeSetSetting(key, value) {
@@ -2630,6 +2638,53 @@ class DpsApp {
         this.renderCurrentRows();
       });
     }
+    // Keybinds on or off. Unset, on for Windows and off for Linux, where the
+    // desktop registers them (the backend's platform::hotkeys::DEFAULT_ON).
+    // The backend starts or stops them as the setting changes.
+    this.globalHotkeysCheckbox = document.querySelector(".globalHotkeysCheckbox");
+    if (this.globalHotkeysCheckbox) {
+      const apply = (on) => {
+        this.globalHotkeysCheckbox.checked = on;
+        this.globalHotkeysCheckbox.closest(".settingsSection")?.classList.toggle("hotkeysOff", !on);
+      };
+      apply(this.globalHotkeysOn());
+      const save = (on) => {
+        apply(on);
+        this.safeSetSetting(this.storageKeys.globalHotkeys, String(on));
+      };
+      // On Linux, turning them on first says that the desktop will register
+      // them and may ask to approve them; nothing is registered until the
+      // user goes ahead.
+      const consent = document.querySelector(".hotkeyConsent");
+      const closeConsent = () => {
+        if (!consent) return;
+        consent.hidden = true;
+        this.globalHotkeysCheckbox.focus?.();
+      };
+      consent?.querySelector(".hotkeyConsentConfirm")?.addEventListener("click", () => {
+        closeConsent();
+        save(true);
+      });
+      consent?.querySelector(".hotkeyConsentCancel")?.addEventListener("click", closeConsent);
+      consent?.addEventListener("keydown", (event) => {
+        if (event.key !== "Escape") return;
+        // Escape here closes the dialog, not the Settings window.
+        event.stopPropagation();
+        event.preventDefault();
+        closeConsent();
+      });
+      this.globalHotkeysCheckbox.addEventListener("change", (event) => {
+        const isChecked = !!event.target?.checked;
+        const linux = document.documentElement?.classList?.contains?.("linux");
+        if (isChecked && linux && consent) {
+          apply(false);
+          consent.hidden = false;
+          consent.querySelector(".hotkeyConsentConfirm")?.focus?.();
+          return;
+        }
+        save(isChecked);
+      });
+    }
     this.autoHideMeterCheckbox = document.querySelector(".autoHideMeterCheckbox");
     if (this.autoHideMeterCheckbox) {
       const storedAutoHide = this.safeGetSetting(this.storageKeys.autoHideMeter) !== "false";
@@ -3852,6 +3907,53 @@ class DpsApp {
     };
     this.refreshKeybindLabels();
 
+    // A key another program holds, or one two of the meter's actions share,
+    // is framed in red, with the reason in a line under its label (a hover
+    // alone goes unread). The backend says which keys it could not register
+    // ("taken"); sharing is read off the labels.
+    let lastHotkeyStatus = {};
+    this.applyHotkeyStatus = (status) => {
+      lastHotkeyStatus = status && typeof status === "object" ? status : {};
+      const rows = [[reloadBtn, "reload"], [toggleBtn, "toggle"], [lockKeyBtn, "lock"]]
+        .filter(([btn]) => btn && btn.closest?.(".settingsRowKeybind")?.style?.display !== "none");
+      const labelOf = (btn) => (btn.querySelector?.(".keybindText")?.textContent || "").trim().toLowerCase();
+      for (const [btn, key] of rows) {
+        const shared = rows.some(([other]) => other !== btn && labelOf(other) === labelOf(btn));
+        const taken = lastHotkeyStatus[key] === "taken";
+        btn.classList?.toggle?.("isTaken", shared || taken);
+        let reason = "";
+        if (shared) {
+          reason = this.i18n?.t?.("settings.keybindShared", "Another action uses these keys. Pick different keys.")
+            ?? "Another action uses these keys. Pick different keys.";
+        } else if (taken) {
+          reason = this.i18n?.t?.("settings.keybindTaken", "Another program already uses these keys. Pick different keys.")
+            ?? "Another program already uses these keys. Pick different keys.";
+        }
+        const info = btn.closest?.(".settingsRowKeybind")?.querySelector?.(".settingsInfo");
+        let hint = info?.querySelector?.(".keybindHint");
+        if (reason && info && !hint && document.createElement) {
+          hint = document.createElement("div");
+          hint.className = "keybindHint";
+          hint.setAttribute?.("role", "status");
+          info.appendChild?.(hint);
+        }
+        if (hint) {
+          hint.textContent = reason;
+          hint.hidden = !reason;
+        }
+        if (reason) btn.title = reason;
+        else btn.removeAttribute?.("title");
+      }
+    };
+    const refreshLabels = this.refreshKeybindLabels;
+    this.refreshKeybindLabels = () => {
+      refreshLabels();
+      this.applyHotkeyStatus(lastHotkeyStatus);
+    };
+    Promise.resolve(window.javaBridge?.getHotkeyStatus?.())
+      .then((status) => this.applyHotkeyStatus(status || {}))
+      .catch(() => {});
+
     let activeRecording = null;
 
     const stopRecording = () => {
@@ -4227,6 +4329,7 @@ class DpsApp {
     for (const [box, name, defaultOn] of [
       [this.bossLogsCheckbox, "bossLogs", false],
       [this.autoHideMeterCheckbox, "autoHideMeter", true],
+      [this.globalHotkeysCheckbox, "globalHotkeys", !document.documentElement?.classList?.contains?.("linux")],
       [this.saveRawPacketsCheckbox, "saveRawPackets", false],
       [document.querySelector(".discordActivityCheckbox"), "discordActivity", false],
     ]) {

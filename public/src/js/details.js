@@ -1795,16 +1795,18 @@ const createDetailsUI = ({
     // ── Legend: a line per player, in the colour it is drawn in (the one
     // selected solid, the rest dashed), then the boss's HP and the ping. ──
     const escapeHtml = (text) => String(text).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
-    const LEGEND_PLAYERS = 6;
-    const legendItems = allSamples.slice(0, LEGEND_PLAYERS).map(({ actor }) => {
+    // Up to six players; fewer when the chart is too short for them all, so
+    // the legend never runs past the chart into the section below.
+    const renderLegend = (shownPlayers) => {
+    const legendItems = allSamples.slice(0, shownPlayers).map(({ actor }) => {
       const fallbackColor = LANE_COLORS[actorList.indexOf(actor) % LANE_COLORS.length];
       const color = getJobColor(actor.job) || fallbackColor;
       const info = detailsActors.get(actor.actorId);
       const name = info?.nickname && info.nickname !== String(actor.actorId) ? info.nickname : `#${actor.actorId}`;
       return { dash: isSelectedActor(actor.actorId) ? "none" : "5,3", color, label: escapeHtml(name) };
     });
-    if (allSamples.length > LEGEND_PLAYERS) {
-      legendItems.push({ dash: "", color: "rgba(255,255,255,0.55)", label: `+${allSamples.length - LEGEND_PLAYERS}` });
+    if (allSamples.length > shownPlayers) {
+      legendItems.push({ dash: "", color: "rgba(255,255,255,0.55)", label: `+${allSamples.length - shownPlayers}` });
     }
     if (!healMode) {
       legendItems.push({ dash: "3,4", color: "rgba(220,60,60,0.9)", label: escapeHtml(labelText("details.chart.bossHp", "Boss HP")) });
@@ -1822,6 +1824,13 @@ const createDetailsUI = ({
         <span style="color:${color}">${label}</span>
       </span>`;
     }).join("");
+    };
+    const legendRoom = dpsChartCanvas.clientHeight;
+    let shownPlayers = Math.min(6, allSamples.length);
+    renderLegend(shownPlayers);
+    while (shownPlayers > 1 && legendRoom > 0 && dpsChartLegend.offsetTop + dpsChartLegend.offsetHeight > legendRoom) {
+      renderLegend(--shownPlayers);
+    }
 
     // X axis labels — aligned to plot area via matching padding
     dpsChartXAxis.innerHTML = "";

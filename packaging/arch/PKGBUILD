@@ -52,12 +52,16 @@ build() {
   cp src/data/skill_icons.json src/data/dot_skill_ids.json public/src/data/
   npm ci
   npx tauri build --no-bundle
+  # The hotkeys helper, run without the meter's capture permission
+  # (platform/linux/hotkeys.rs); the .install script gives caps to the meter only.
+  cargo build --release --manifest-path src-tauri/Cargo.toml --bin a2tools-hotkeys
 }
 
 package() {
   local root
   root="$(_root)"
   install -Dm755 "$root/src-tauri/target/release/a2tools-dps-meter" "$pkgdir/usr/bin/a2tools-dps-meter"
+  install -Dm755 "$root/src-tauri/target/release/a2tools-hotkeys" "$pkgdir/usr/bin/a2tools-hotkeys"
 
   # Tauri resolves resources to /usr/lib/<name>; ship both spellings of the
   # name so either resolution finds the data.

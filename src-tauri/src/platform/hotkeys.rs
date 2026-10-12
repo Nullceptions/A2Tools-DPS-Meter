@@ -1,7 +1,7 @@
 //! Global hotkeys. Parsing the label is OS-neutral; registering it is not, and
 //! comes from the OS implementation as `HotkeyManager`.
 
-pub use super::os::hotkeys::HotkeyManager;
+pub use super::os::hotkeys::{run_helper, HotkeyManager, DEFAULT_ON};
 
 /// Parse a hotkey label like "Ctrl+Alt+R" or "Ctrl+Shift+F5" into (modifiers, vk_code).
 /// Returns None if the label is empty or unparseable.

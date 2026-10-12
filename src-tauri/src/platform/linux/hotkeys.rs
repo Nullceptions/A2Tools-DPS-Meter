@@ -12,10 +12,19 @@
 //!
 //! The keys are only suggestions here, so the meter's own Keybinds settings
 //! decide what is suggested; the desktop decides what is bound.
+//!
+//! The portal work runs in a helper process, `a2tools-hotkeys`, never in the
+//! meter. The portal reads a caller's /proc/<pid>/root, and Linux refuses that
+//! to a program lacking the capabilities its target holds: the packaged meter
+//! holds cap_net_raw (for capture) and the portal does not, so every call the
+//! meter made was refused ("Unable to open /proc/<pid>/root", #42), dumpable
+//! or not. The helper is a separate executable without file capabilities, and
+//! a program the meter starts does not inherit the meter's, so the portal
+//! reads it like any app. It reports back on stdout: `status <id> ok|taken`
+//! and `fire <id>`.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 use tracing::{info, warn};
 use zbus::blocking::{Connection, Proxy};
@@ -34,24 +43,28 @@ const RELOAD: &str = "reset";
 const TOGGLE: &str = "toggle";
 const LOCK: &str = "lock";
 
+/// Off until the user turns them on (Settings → Keybinds): the desktop asks
+/// to approve the shortcuts, which should not appear unasked.
+pub const DEFAULT_ON: bool = false;
+
+/// The helper's file name, next to the meter's own executable.
+const HELPER: &str = "a2tools-hotkeys";
+
 pub struct HotkeyManager {
-    running: Arc<AtomicBool>,
-    /// The portal connection while shortcuts are bound; closing it ends the
-    /// session and the listener.
-    connection: Arc<Mutex<Option<Connection>>>,
+    /// The running helper, if any.
+    child: Mutex<Option<std::process::Child>>,
 }
 
 impl HotkeyManager {
     pub fn new() -> Self {
         Self {
-            running: Arc::new(AtomicBool::new(false)),
-            connection: Arc::new(Mutex::new(None)),
+            child: Mutex::new(None),
         }
     }
 
-    /// Bind the three shortcuts and listen for them. The numbers are the
-    /// Win32 modifier flags and virtual-key codes settings store
-    /// (`parse_hotkey_label`); a key of 0 leaves that shortcut out.
+    /// Start the helper with the three shortcuts and act on what it reports.
+    /// The numbers are the Win32 modifier flags and virtual-key codes settings
+    /// store (`parse_hotkey_label`); a key of 0 leaves that shortcut out.
     #[allow(clippy::too_many_arguments)]
     pub fn start(
         &self,
@@ -64,45 +77,131 @@ impl HotkeyManager {
         on_reload: impl Fn() + Send + 'static,
         on_toggle: impl Fn() + Send + 'static,
         on_lock: impl Fn() + Send + 'static,
+        on_status: impl Fn(&'static str, bool) + Send + 'static,
     ) {
-        if self.running.swap(true, Ordering::SeqCst) {
-            return;
+        use std::io::BufRead;
+        use std::process::{Command, Stdio};
+
+        let mut slot = self.child.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(child) = slot.as_mut() {
+            if matches!(child.try_wait(), Ok(None)) {
+                return;
+            }
         }
-        let wanted: Vec<(&'static str, &'static str, Option<String>)> = [
+        let mut args = Vec::new();
+        for (id, description, mods, vk) in [
             (RELOAD, "Reset the meter", reload_mods, reload_vk),
             (TOGGLE, "Show or hide the meter", toggle_mods, toggle_vk),
             (LOCK, "Turn the click-through lock on or off", lock_mods, lock_vk),
-        ]
-        .into_iter()
-        .filter(|&(_, _, _, vk)| vk != 0)
-        .map(|(id, description, mods, vk)| (id, description, trigger(mods, vk)))
-        .collect();
-
-        let running = self.running.clone();
-        let slot = self.connection.clone();
-        std::thread::spawn(move || {
-            let result = listen(&wanted, &slot, |id| match id {
-                RELOAD => on_reload(),
-                TOGGLE => on_toggle(),
-                LOCK => on_lock(),
-                _ => {}
-            });
-            if let Err(e) = result {
-                warn!("Global hotkeys unavailable (no GlobalShortcuts portal?): {e}");
+        ] {
+            if vk != 0 {
+                args.push("--shortcut".to_string());
+                args.push(format!("{id}\t{description}\t{}", trigger(mods, vk).unwrap_or_default()));
             }
-            *slot.lock().unwrap_or_else(|p| p.into_inner()) = None;
-            running.store(false, Ordering::SeqCst);
+        }
+        let path = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(|dir| dir.join(HELPER)))
+            .filter(|path| path.exists())
+            .unwrap_or_else(|| std::path::PathBuf::from(HELPER));
+        let mut child = match Command::new(&path)
+            .args(&args)
+            // Its stdin is how it learns the meter is gone: it exits at EOF.
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(e) => {
+                warn!("Global hotkeys unavailable: cannot start {}: {e}", path.display());
+                return;
+            }
+        };
+        let Some(stdout) = child.stdout.take() else { return };
+        *slot = Some(child);
+        drop(slot);
+
+        std::thread::spawn(move || {
+            for line in std::io::BufReader::new(stdout).lines().map_while(Result::ok) {
+                let mut parts = line.splitn(3, ' ');
+                match (parts.next(), parts.next(), parts.next()) {
+                    (Some("fire"), Some(id), _) => match id {
+                        RELOAD => on_reload(),
+                        TOGGLE => on_toggle(),
+                        LOCK => on_lock(),
+                        _ => {}
+                    },
+                    (Some("status"), Some(id), Some(state)) => {
+                        if let Some(key) = status_key(id) {
+                            on_status(key, state == "ok");
+                        }
+                    }
+                    (Some("error"), _, _) => warn!("Global hotkeys unavailable: {}", &line[6.min(line.len())..]),
+                    _ => info!("Hotkeys helper: {line}"),
+                }
+            }
         });
     }
 
+    /// Stop the helper. Its portal session ends with it, so the desktop
+    /// drops the shortcuts.
     pub fn stop(&self) {
-        // Closing the connection ends the portal session, and with it the
-        // listener's signal stream.
-        let connection = self.connection.lock().unwrap_or_else(|p| p.into_inner()).take();
-        if let Some(connection) = connection {
-            let _ = connection.close();
+        let child = self.child.lock().unwrap_or_else(|p| p.into_inner()).take();
+        if let Some(mut child) = child {
+            let _ = child.kill();
+            let _ = child.wait();
         }
-        self.running.store(false, Ordering::SeqCst);
+    }
+}
+
+/// The helper's whole life: register the shortcuts given as
+/// `--shortcut "<id>\t<description>\t<trigger>"`, print what happens, and
+/// exit when the meter closes our stdin (or dies). Returns the exit code.
+pub fn run_helper() -> i32 {
+    use std::io::{Read, Write};
+
+    let mut wanted: Vec<(&'static str, &'static str, Option<String>)> = Vec::new();
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        if arg != "--shortcut" {
+            continue;
+        }
+        let Some(spec) = args.next() else { break };
+        let mut fields = spec.splitn(3, '\t');
+        let (Some(id), Some(description)) = (fields.next(), fields.next()) else { continue };
+        let trigger = fields.next().filter(|t| !t.is_empty()).map(str::to_string);
+        // Known ids only: they are what the portal and Hyprland are told.
+        let Some(id) = [RELOAD, TOGGLE, LOCK].into_iter().find(|known| *known == id) else { continue };
+        let description: &'static str = Box::leak(description.to_string().into_boxed_str());
+        wanted.push((id, description, trigger));
+    }
+    if wanted.is_empty() {
+        println!("error no shortcuts given");
+        return 2;
+    }
+
+    // The meter closing our stdin, or exiting, ends us too.
+    std::thread::spawn(|| {
+        let mut sink = [0u8; 64];
+        let mut stdin = std::io::stdin();
+        while matches!(stdin.read(&mut sink), Ok(n) if n > 0) {}
+        std::process::exit(0);
+    });
+
+    let say = |line: String| {
+        let mut out = std::io::stdout().lock();
+        let _ = writeln!(out, "{line}");
+        let _ = out.flush();
+    };
+    let slot = Mutex::new(None);
+    let status = |id: &str, ok: bool| say(format!("status {id} {}", if ok { "ok" } else { "taken" }));
+    match listen(&wanted, &slot, &status, |id| say(format!("fire {id}"))) {
+        Ok(()) => 0,
+        Err(e) => {
+            say(format!("error {e} (no GlobalShortcuts portal?)"));
+            1
+        }
     }
 }
 
@@ -153,11 +252,55 @@ fn trigger(mods: u32, vk: u32) -> Option<String> {
     Some(out)
 }
 
+/// The settings' name for a shortcut id (`reset` is the reload key).
+fn status_key(id: &str) -> Option<&'static str> {
+    match id {
+        RELOAD => Some("reload"),
+        TOGGLE => Some("toggle"),
+        LOCK => Some("lock"),
+        _ => None,
+    }
+}
+
+/// Which shortcuts the desktop gave a key, from BindShortcuts' `shortcuts`
+/// result (`a(sa{sv})`, each with its `trigger_description`). A shortcut the
+/// desktop bound to nothing, because its suggested keys were taken, comes
+/// back with an empty description. `None` when the desktop says nothing.
+fn assigned(results: &HashMap<String, OwnedValue>) -> Option<Vec<(String, bool)>> {
+    let list = results.get("shortcuts")?;
+    let array = list.downcast_ref::<zbus::zvariant::Array>().ok()?;
+    let mut out = Vec::new();
+    for item in array.iter() {
+        let Value::Structure(entry) = item else { continue };
+        let fields = entry.fields();
+        let Some(Value::Str(id)) = fields.first() else { continue };
+        let Some(Value::Dict(props)) = fields.get(1) else { continue };
+        let described = props
+            .get::<&str, Value>(&"trigger_description")
+            .ok()
+            .flatten()
+            .is_some_and(|v| non_empty_text(&v));
+        out.push((id.as_str().to_string(), described));
+    }
+    Some(out)
+}
+
+/// A string with something in it, through any `v` wrapping.
+fn non_empty_text(value: &Value) -> bool {
+    match value {
+        Value::Str(s) => !s.as_str().trim().is_empty(),
+        Value::Value(inner) => non_empty_text(inner),
+        _ => false,
+    }
+}
+
 /// Register, open a session, bind the shortcuts and call `fire` with each
-/// activated shortcut's id until the connection closes.
+/// activated shortcut's id until the connection closes. `status(id, bound)`
+/// reports, per shortcut, whether a key is behind it.
 fn listen(
     wanted: &[(&'static str, &'static str, Option<String>)],
     slot: &Mutex<Option<Connection>>,
+    status: &dyn Fn(&str, bool),
     fire: impl Fn(&str),
 ) -> zbus::Result<()> {
     let connection = Connection::session()?;
@@ -178,7 +321,8 @@ fn listen(
     let mut options: HashMap<&str, Value> = HashMap::new();
     options.insert("handle_token", Value::from("a2t_session_req"));
     options.insert("session_handle_token", Value::from("a2t_session"));
-    let (code, results) = request(&connection, &portal, "a2t_session_req", "CreateSession", &(options,))?;
+    let (code, results) =
+        request(&connection, &portal, "a2t_session_req", "CreateSession", &(options,), || {})?;
     if code != 0 {
         return Err(zbus::Error::Failure(format!("CreateSession refused ({code})")));
     }
@@ -201,12 +345,13 @@ fn listen(
         .collect();
     let mut bind_options: HashMap<&str, Value> = HashMap::new();
     bind_options.insert("handle_token", Value::from("a2t_bind_req"));
-    let (code, _) = request(
+    let (code, bound) = request(
         &connection,
         &portal,
         "a2t_bind_req",
         "BindShortcuts",
         &(&session_path, shortcuts, "", bind_options),
+        || {},
     )?;
     if code != 0 {
         // 1: the user dismissed the desktop's dialog. Nothing is bound.
@@ -222,7 +367,13 @@ fn listen(
     );
 
     if std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_some() {
-        hyprland_bind(wanted);
+        // Hyprland's portal assigns no keys; the meter binds them itself and
+        // knows which it could.
+        hyprland_bind(wanted, status);
+    } else if let Some(assigned) = assigned(&bound) {
+        for (id, ok) in assigned {
+            status(&id, ok);
+        }
     }
 
     *slot.lock().unwrap_or_else(|p| p.into_inner()) = Some(connection.clone());
@@ -247,7 +398,7 @@ fn listen(
 /// again). A key combination that is already bound, by the user or by an
 /// earlier start, is left alone, so nothing of theirs is shadowed and nothing
 /// fires twice.
-fn hyprland_bind(wanted: &[(&'static str, &'static str, Option<String>)]) {
+fn hyprland_bind(wanted: &[(&'static str, &'static str, Option<String>)], status: &dyn Fn(&str, bool)) {
     use std::process::Command;
     let run = |args: &[&str]| -> Option<String> {
         let out = Command::new("hyprctl").args(args).output().ok()?;
@@ -285,6 +436,7 @@ fn hyprland_bind(wanted: &[(&'static str, &'static str, Option<String>)]) {
         let Some((mods, key)) = hyprland_keys(trigger) else { continue };
         if existing.iter().any(|(m, k)| *m == mods.mask && *k == key.to_lowercase()) {
             info!("Hyprland: {} is already bound; left for {name}", trigger);
+            status(id, false);
             continue;
         }
         // Lua config (current Hyprland) first, then the hyprlang `keyword`.
@@ -296,6 +448,7 @@ fn hyprland_bind(wanted: &[(&'static str, &'static str, Option<String>)]) {
         let ok = run(&["eval", &lua]).is_some_and(|s| s.trim() == "ok")
             || run(&["keyword", "bind", &format!("{}, {}, global, {}", mods.space_joined(), key, name)])
                 .is_some_and(|s| s.trim() == "ok");
+        status(id, ok);
         if ok {
             info!("Hyprland: bound {trigger} to {name}");
         } else {
@@ -371,6 +524,7 @@ fn request<B>(
     token: &str,
     method: &str,
     body: &B,
+    sent: impl FnOnce(),
 ) -> zbus::Result<(u32, HashMap<String, OwnedValue>)>
 where
     B: serde::Serialize + zbus::zvariant::DynamicType,
@@ -383,6 +537,8 @@ where
     let request = proxy(connection, &path, "org.freedesktop.portal.Request")?;
     let mut responses = request.receive_signal("Response")?;
     let _handle: zbus::zvariant::OwnedObjectPath = portal.call(method, body)?;
+    // The portal has checked the caller by now; only the answer is awaited.
+    sent();
     let message = responses
         .next()
         .ok_or_else(|| zbus::Error::Failure(format!("{method}: no response")))?;

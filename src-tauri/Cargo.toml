@@ -1,6 +1,6 @@
 [package]
 name = "a2tools-dps-meter"
-version = "2.0.57"
+version = "2.0.61"
 description = "A2Tools DPS Meter - AION 2 real-time DPS overlay"
 authors = ["taengu"]
 edition = "2024"
@@ -37,6 +37,7 @@ online = [
     "dep:futures-util",
     "dep:urlencoding",
     "dep:discord-rich-presence",
+    "dep:ed25519-dalek",
 ]
 desktop = [
     "dep:tauri",
@@ -68,6 +69,13 @@ required-features = ["desktop"]
 # prints what is in it. Kept outside src/bin/, which .gitignore excludes for
 # scratch debug binaries — this one has to ship in the public repo to be worth
 # anything.
+# Linux global hotkeys, in a process without the meter's capture permission
+# (platform::linux::hotkeys). Packaged next to the meter, never given caps.
+[[bin]]
+name = "a2tools-hotkeys"
+path = "tools/a2t_hotkeys.rs"
+required-features = ["desktop"]
+
 [[bin]]
 name = "a2t-probe"
 path = "tools/a2t_probe.rs"
@@ -114,6 +122,8 @@ futures-util = { version = "0.3", optional = true }
 getrandom = { version = "0.3", optional = true }
 urlencoding = { version = "2", optional = true }
 sha2 = "0.11.0"
+# Checks the signature on the reviewed-plugin catalog (src/plugins/catalog.rs).
+ed25519-dalek = { version = "2", default-features = false, features = ["std"], optional = true }
 flate2 = { version = "1.1.10", optional = true }
 
 [target.'cfg(windows)'.dependencies]

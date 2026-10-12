@@ -1,0 +1,109 @@
+/* A plugin window's host page: a thin bar naming the plugin, then its frame. */
+html, body {
+  margin: 0;
+  height: 100%;
+  background: transparent;
+  color: rgba(255, 255, 255, 0.88);
+  font: 13px/1.4 "Segoe UI", system-ui, sans-serif;
+}
+/* The window is transparent; this is the panel, at the slider's opacity. */
+body {
+  display: flex;
+  flex-direction: column;
+  background: rgba(10, 14, 22, var(--panel-alpha, 1));
+  box-sizing: border-box;
+  border: 1px solid rgba(255, 255, 255, calc(0.12 * var(--panel-alpha, 1)));
+}
+.pluginBar {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border-bottom: 1px solid rgba(255, 255, 255, calc(0.08 * var(--panel-alpha, 1)));
+  cursor: grab;
+  user-select: none;
+}
+.pluginBadge {
+  flex: none;
+  white-space: nowrap;
+  padding: 1px 7px;
+  border: 1px solid #d9a13c;
+  border-radius: 3px;
+  color: #f0c46c;
+  font-size: 11px;
+}
+.pluginName {
+  font-weight: 600;
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+/* The meter's header icons: 15px line icons, dim until hovered. */
+.pluginCompact,
+.pluginClose {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 15px;
+  height: 15px;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: rgba(255, 255, 255, 0.55);
+  cursor: pointer;
+  transition: color 120ms ease;
+}
+.pluginCompact svg,
+.pluginClose svg {
+  width: 15px;
+  height: 15px;
+}
+.pluginCompact svg {
+  transition: transform 120ms ease;
+}
+.pluginCompact[aria-pressed="true"] svg {
+  transform: rotate(180deg);
+}
+.pluginCompact:hover,
+.pluginCompact:focus-visible,
+.pluginClose:hover,
+.pluginClose:focus-visible {
+  color: #fff;
+}
+.pluginOpacity {
+  flex: none;
+  width: 64px;
+  height: 14px;
+  margin: 0;
+  accent-color: #8fc2ff;
+  opacity: 0.6;
+  cursor: pointer;
+}
+.pluginOpacity:hover,
+.pluginOpacity:focus-visible {
+  opacity: 1;
+}
+.pluginStage {
+  flex: 1 1 auto;
+  min-height: 0;
+}
+.pluginStage iframe {
+  display: block;
+  width: 100%;
+  height: 100%;
+  border: 0;
+}
+.pluginToast {
+  position: fixed;
+  left: 12px;
+  right: 12px;
+  bottom: 12px;
+  padding: 8px 10px;
+  border-radius: 4px;
+  background: rgba(30, 40, 60, 0.96);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+}

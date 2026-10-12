@@ -3,10 +3,15 @@ use std::sync::Arc;
 
 use tracing::{info, warn};
 
+/// On unless the user turns them off (Settings → Keybinds).
+pub const DEFAULT_ON: bool = true;
+
 /// Global hotkey manager using Win32 RegisterHotKey.
 /// Runs its own message loop thread to receive WM_HOTKEY messages.
 pub struct HotkeyManager {
-    running: Arc<AtomicBool>,
+    /// The listener thread and its own stop flag, while one runs. Each start
+    /// makes a new pair, so a stop and a start cannot share a flag.
+    listener: std::sync::Mutex<Option<(Arc<AtomicBool>, std::thread::JoinHandle<()>)>>,
 }
 
 impl HotkeyManager {
@@ -16,7 +21,7 @@ impl HotkeyManager {
 
     pub fn new() -> Self {
         Self {
-            running: Arc::new(AtomicBool::new(false)),
+            listener: std::sync::Mutex::new(None),
         }
     }
 
@@ -24,6 +29,9 @@ impl HotkeyManager {
     /// `on_reload` is called when the reload hotkey fires.
     /// `on_toggle` is called when the toggle window hotkey fires.
     /// `on_lock` is called when the click-through lock hotkey fires.
+    /// `on_status("reload" | "toggle" | "lock", registered)` says, for each
+    /// key set, whether Windows let the meter have it: false when another
+    /// program holds that combination.
     #[allow(clippy::too_many_arguments)]
     pub fn start(
         &self,
@@ -36,14 +44,17 @@ impl HotkeyManager {
         on_reload: impl Fn() + Send + 'static,
         on_toggle: impl Fn() + Send + 'static,
         on_lock: impl Fn() + Send + 'static,
+        on_status: impl Fn(&'static str, bool) + Send + 'static,
     ) {
-        if self.running.swap(true, Ordering::SeqCst) {
+        let mut listener = self.listener.lock().unwrap_or_else(|p| p.into_inner());
+        if listener.as_ref().is_some_and(|(running, _)| running.load(Ordering::SeqCst)) {
             return;
         }
 
-        let running = self.running.clone();
+        let running = Arc::new(AtomicBool::new(true));
+        let flag = running.clone();
 
-        std::thread::spawn(move || {
+        let thread = std::thread::spawn(move || {
             use windows::Win32::UI::Input::KeyboardAndMouse::*;
             use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -87,6 +98,10 @@ impl HotkeyManager {
                     }
                 }
 
+                if reload_vk > 0 { on_status("reload", reload_ok); }
+                if toggle_vk > 0 { on_status("toggle", toggle_ok); }
+                if lock_vk > 0 { on_status("lock", lock_ok); }
+
                 info!("Global hotkeys registered (reload={:#x}+{:#x}, toggle={:#x}+{:#x}, lock={:#x}+{:#x})",
                     reload_mods, reload_vk, toggle_mods, toggle_vk, lock_mods, lock_vk);
 
@@ -111,11 +126,27 @@ impl HotkeyManager {
                 if reload_ok { let _ = UnregisterHotKey(None, Self::HOTKEY_RELOAD); }
                 if toggle_ok { let _ = UnregisterHotKey(None, Self::HOTKEY_TOGGLE); }
                 if lock_ok { let _ = UnregisterHotKey(None, Self::HOTKEY_LOCK); }
+                info!("Global hotkeys unregistered");
             }
         });
+        *listener = Some((flag, thread));
     }
 
+    /// Stop listening and unregister the hotkeys, waiting for the listener
+    /// to do so (it checks every 50 ms), so a start right after can register
+    /// the same keys again.
     pub fn stop(&self) {
-        self.running.store(false, Ordering::SeqCst);
+        let listener = self.listener.lock().unwrap_or_else(|p| p.into_inner()).take();
+        if let Some((running, thread)) = listener {
+            running.store(false, Ordering::SeqCst);
+            let _ = thread.join();
+        }
     }
+}
+
+/// The hotkeys helper (`a2tools-hotkeys`) is for Linux, where the portal
+/// cannot be asked from the meter itself; here it has nothing to do.
+pub fn run_helper() -> i32 {
+    println!("error the hotkeys helper is only used on Linux");
+    2
 }

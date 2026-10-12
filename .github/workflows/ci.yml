@@ -13,10 +13,10 @@ env:
 jobs:
   frontend:
     name: Frontend build and tests
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: "24"
           cache: npm
@@ -28,7 +28,7 @@ jobs:
     name: Desktop build and tests
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -45,9 +45,9 @@ jobs:
 
   platform-boundary:
     name: OS code stays in src/platform
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # Windows and (later) Linux builds share one codebase. What keeps them from
       # getting tangled is that only src/platform/ may know which OS it is on:
       # it picks one implementation (win32/ or unsupported/, later linux/) and
@@ -67,9 +67,9 @@ jobs:
 
   desktop-linux:
     name: Desktop builds and tests on Linux
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -101,9 +101,9 @@ jobs:
 
   parser-wasm:
     name: Parser compiles to wasm32
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown

@@ -28,7 +28,7 @@ on:
 jobs:
   package:
     name: makepkg
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     container: archlinux:base-devel
     env:
       # Where rust-cache restores and saves the registry; the builder user
@@ -40,7 +40,7 @@ jobs:
         run: |
           pacman -Syu --noconfirm --needed git rust nodejs npm pkgconf \
             webkit2gtk-4.1 gtk3 libpcap libcap hicolor-icon-theme
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.ref }}
           fetch-depth: 0
@@ -62,7 +62,7 @@ jobs:
         run: |
           ldd "$GITHUB_WORKSPACE/src-tauri/target/release/a2tools-dps-meter" | sort
           ls -la "$GITHUB_WORKSPACE"/packaging/arch/*.pkg.tar.zst
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: arch-package
           path: packaging/arch/*.pkg.tar.zst
@@ -72,7 +72,7 @@ jobs:
     name: .deb and .rpm
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.ref }}
       - uses: dtolnay/rust-toolchain@stable
@@ -80,7 +80,7 @@ jobs:
         with:
           workspaces: src-tauri
           key: deb-rpm
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 20
           cache: npm
@@ -100,6 +100,9 @@ jobs:
       - name: Build
         run: |
           npm ci
+          # The hotkeys helper first: tauri.linux.conf.json packs it next to
+          # the meter (platform/linux/hotkeys.rs), without capabilities.
+          cargo build --release --manifest-path src-tauri/Cargo.toml --bin a2tools-hotkeys
           npx tauri build --bundles deb,rpm
       # Tauri's .rpm can only grant capture permission from a %post script,
       # which rpm-ostree (Bazzite and the other image-based Fedoras) runs
@@ -144,7 +147,9 @@ jobs:
           rpm -qp --scripts out/*.rpm
           rpm -qp --filecaps out/*.rpm | grep cap_net_raw
           rpm -qlp out/*.rpm | grep -E '^/usr/(bin|share/applications)/'
-      - uses: actions/upload-artifact@v4
+          dpkg-deb --contents out/*.deb | grep -q usr/bin/a2tools-hotkeys
+          rpm -qlp out/*.rpm | grep -qx /usr/bin/a2tools-hotkeys
+      - uses: actions/upload-artifact@v7
         with:
           name: deb-rpm-packages
           path: out/*
@@ -153,7 +158,7 @@ jobs:
   install-test:
     name: Install on ${{ matrix.image }}
     needs: deb-rpm
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     container: ${{ matrix.image }}
     strategy:
       fail-fast: false
@@ -166,7 +171,7 @@ jobs:
           - image: fedora:41
             install: dnf install -y ./a2tools-dps-meter-*.x86_64.rpm
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: deb-rpm-packages
       # Dependencies resolve, the install script grants capture permission,
@@ -178,6 +183,9 @@ jobs:
           set -e
           test -x /usr/bin/a2tools-dps-meter
           getcap /usr/bin/a2tools-dps-meter | tee /dev/stderr | grep -q cap_net_raw
+          # The hotkeys helper: present, and without any capability, which is
+          # what lets the desktop portal accept it (#42).
+          test -x /usr/bin/a2tools-hotkeys && test -z "$(getcap /usr/bin/a2tools-hotkeys)"
           if ldd /usr/bin/a2tools-dps-meter | grep 'not found'; then exit 1; fi
           # Under one of the names platform/linux/pcap.rs loads it by.
           ldconfig -p | grep -qE 'libpcap\.so\.(1|0\.8) ' || { echo "libpcap missing"; exit 1; }
@@ -188,10 +196,10 @@ jobs:
   rpm-repo:
     name: RPM repository
     needs: deb-rpm
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     container: fedora:41
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: deb-rpm-packages
       - name: Metadata
@@ -209,7 +217,8 @@ jobs:
             > /etc/yum.repos.d/a2tools.repo
           dnf install -y a2-tools-dps-meter
           getcap /usr/bin/a2tools-dps-meter | grep cap_net_raw
-      - uses: actions/upload-artifact@v4
+          test -x /usr/bin/a2tools-hotkeys && test -z "$(getcap /usr/bin/a2tools-hotkeys)"
+      - uses: actions/upload-artifact@v7
         with:
           name: rpm-repo
           path: repo
@@ -222,7 +231,7 @@ jobs:
   bazzite:
     name: Install on Bazzite
     needs: rpm-repo
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       # The image is large; the runner needs the room. The runner's scratch
       # disk (/mnt) usually has plenty, so the image goes there; deleting
@@ -241,7 +250,7 @@ jobs:
             wait
             df -h /
           fi
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: rpm-repo
           path: repo
@@ -259,6 +268,7 @@ jobs:
               dnf install -y a2-tools-dps-meter
             fi
             getcap /usr/bin/a2tools-dps-meter | tee /dev/stderr | grep -q cap_net_raw
+            test -x /usr/bin/a2tools-hotkeys && test -z "$(getcap /usr/bin/a2tools-hotkeys)"
             if ldd /usr/bin/a2tools-dps-meter | grep "not found"; then exit 1; fi
             ldconfig -p | grep -qE "libpcap\.so\.(1|0\.8) "
           '
@@ -278,7 +288,7 @@ jobs:
     # in 2.0.56). A real Steam Deck is still unconfirmed (docs/linux.md).
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: arch-package
           path: pkg

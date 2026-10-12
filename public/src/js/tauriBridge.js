@@ -306,6 +306,10 @@
   const settingsLifecycleReady = Promise.all([settingsShownSubscription, settingsHiddenSubscription]);
 
   // The lock hotkey toggled the click-through lock; the page follows.
+  listen("hotkey-status", (event) => {
+    window._dpsApp?.applyHotkeyStatus?.(event?.payload || {});
+  });
+
   listen("overlay-lock-changed", (event) => {
     window._dpsApp?._onOverlayLockChanged?.(!!event?.payload);
   });
@@ -707,13 +711,19 @@
 
     // --- Hotkeys ---
     getCurrentHotKey() {
-      return this.getSetting("dpsMeter.hotkey") || "Ctrl+Alt+Shift+R";
+      // The backend's default (app.rs, start_hotkeys). "Ctrl+Alt+Shift+R"
+      // here since 2.0.6 showed a key that was never registered.
+      return this.getSetting("dpsMeter.hotkey") || "Ctrl+Alt+R";
     },
     getCurrentToggleWindowHotKey() {
       return this.getSetting("dpsMeter.toggleWindowHotkey") || "Ctrl+Alt+Up";
     },
     getCurrentLockHotKey() {
       return this.getSetting("dpsMeter.lockHotkey") || "Ctrl+Alt+L";
+    },
+    // Each key's registration: { reload|toggle|lock: "ok" | "taken" }.
+    getHotkeyStatus() {
+      return invoke("get_hotkey_status").catch(() => ({}));
     },
     setLockHotkey(mods, vk) {
       this.setSetting("dpsMeter.lockHotkey", this._buildHotkeyLabel(mods, vk));

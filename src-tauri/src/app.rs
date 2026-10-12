@@ -12,7 +12,7 @@
 // where these were siblings at the crate root.
 use crate::{entity, i18n, logging, platform, share};
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -587,6 +587,140 @@ fn apply_all_targets_window(state: &AppState, value: &str) {
     }
 }
 
+/// Whether global hotkeys are on (Settings → Keybinds). Unset, each OS's
+/// default: on for Windows, off for Linux, where registering makes the meter
+/// briefly inspectable (`platform::hotkeys::DEFAULT_ON`).
+const GLOBAL_HOTKEYS_KEY: &str = "dpsMeter.globalHotkeys";
+
+/// The hotkey listener, kept so the setting can start and stop it, and what
+/// each key's registration came to: "ok", or "taken" when another program
+/// (or, on Linux, the desktop) holds that combination. Settings frames a
+/// taken key in red.
+struct Hotkeys {
+    manager: platform::hotkeys::HotkeyManager,
+    status: Arc<Mutex<HashMap<String, String>>>,
+}
+
+/// The keybind settings: changing one registers the keys again.
+const HOTKEY_KEYS: [&str; 3] = ["dpsMeter.hotkey", "dpsMeter.toggleWindowHotkey", "dpsMeter.lockHotkey"];
+
+/// What each key's registration came to, for Settings to show.
+#[tauri::command]
+fn get_hotkey_status(hotkeys: tauri::State<'_, Hotkeys>) -> HashMap<String, String> {
+    hotkeys.status.lock().clone()
+}
+
+fn set_hotkey_status(app: &tauri::AppHandle, update: impl FnOnce(&mut HashMap<String, String>)) {
+    let Some(hotkeys) = app.try_state::<Hotkeys>() else { return };
+    let snapshot = {
+        let mut status = hotkeys.status.lock();
+        update(&mut status);
+        status.clone()
+    };
+    let _ = app.emit("hotkey-status", snapshot);
+}
+
+/// Start or stop the hotkeys to match the settings.
+fn apply_global_hotkeys(app: &tauri::AppHandle) {
+    let Some(state) = app.try_state::<AppState>() else { return };
+    let wanted = match state.settings.get(GLOBAL_HOTKEYS_KEY).as_deref() {
+        Some("true") => true,
+        Some("false") => false,
+        _ => platform::hotkeys::DEFAULT_ON,
+    };
+    if wanted {
+        start_hotkeys(app, &state.settings);
+    } else if let Some(hotkeys) = app.try_state::<Hotkeys>() {
+        hotkeys.manager.stop();
+        set_hotkey_status(app, |s| s.clear());
+    }
+}
+
+/// A key changed: register them again with it, if they are on.
+fn restart_global_hotkeys(app: &tauri::AppHandle) {
+    if let Some(hotkeys) = app.try_state::<Hotkeys>() {
+        hotkeys.manager.stop();
+    }
+    set_hotkey_status(app, |s| s.clear());
+    apply_global_hotkeys(app);
+}
+
+/// Register the hotkeys from saved settings (or defaults).
+fn start_hotkeys(app: &tauri::AppHandle, settings: &Settings) {
+    let hotkey_handle = app.clone();
+    let Some(hotkeys) = app.try_state::<Hotkeys>() else { return };
+    let status_handle = app.clone();
+
+    let reload_label = settings
+        .get("dpsMeter.hotkey").unwrap_or_default();
+    let toggle_label = settings
+        .get("dpsMeter.toggleWindowHotkey").unwrap_or_default();
+    let lock_label = settings
+        .get("dpsMeter.lockHotkey").unwrap_or_default();
+
+    let (reload_mods, reload_vk) = platform::hotkeys::parse_hotkey_label(&reload_label)
+        .unwrap_or((0x0002 | 0x0001, 0x52)); // Default: Ctrl+Alt+R
+    let (toggle_mods, toggle_vk) = platform::hotkeys::parse_hotkey_label(&toggle_label)
+        .unwrap_or((0x0002 | 0x0001, 0x26)); // Default: Ctrl+Alt+Up
+    let (lock_mods, lock_vk) = platform::hotkeys::parse_hotkey_label(&lock_label)
+        .unwrap_or((0x0002 | 0x0001, 0x4C)); // Default: Ctrl+Alt+L
+
+    hotkeys.manager.start(
+        reload_mods, reload_vk,
+        toggle_mods, toggle_vk,
+        lock_mods, lock_vk,
+        {
+            let h = hotkey_handle.clone();
+            move || {
+                tracing::info!("Hotkey: reload triggered");
+                save_fights_before_reset(&h);
+                if let Some(state) = h.try_state::<AppState>() {
+                    state.dps_calculator.lock().restart_target_selection(true);
+                    state.data_storage.forget_guessed_nicknames();
+                }
+                // Notify frontend to clear UI
+                let _ = h.emit("combat-reset", ());
+                let _ = h.emit("dps-update", &entity::dps_data::DpsData::new());
+            }
+        },
+        {
+            let h = hotkey_handle.clone();
+            move || {
+                // Toggle window visibility
+                if let Some(window) = h.get_webview_window("main") {
+                    if window.is_visible().unwrap_or(false) {
+                        let _ = window.hide();
+                    } else {
+                        let _ = window.show();
+                        let _ = window.set_always_on_top(true);
+                        let _ = window.set_focus();
+                    }
+                }
+            }
+        },
+        {
+            let h = hotkey_handle;
+            move || {
+                // Toggle the click-through lock, and tell the page so
+                // its button and saved setting follow.
+                let locked = h
+                    .try_state::<AppState>()
+                    .is_some_and(|s| s.overlay_lock.locked.load(std::sync::atomic::Ordering::SeqCst));
+                if platform::window::cursor_position().is_none() && !locked {
+                    return; // the lock is not offered here
+                }
+                apply_overlay_lock(&h, !locked);
+                let _ = h.emit("overlay-lock-changed", !locked);
+            }
+        },
+        move |key, ok| {
+            set_hotkey_status(&status_handle, |s| {
+                s.insert(key.to_string(), if ok { "ok" } else { "taken" }.to_string());
+            });
+        },
+    );
+}
+
 #[tauri::command]
 fn update_settings(
     app: tauri::AppHandle,
@@ -597,6 +731,12 @@ fn update_settings(
     if state.settings.set(&key, &value) {
         if key == ALL_TARGETS_WINDOW_KEY {
             apply_all_targets_window(&state, &value);
+        }
+        if key == GLOBAL_HOTKEYS_KEY {
+            apply_global_hotkeys(&app);
+        }
+        if HOTKEY_KEYS.contains(&key.as_str()) {
+            restart_global_hotkeys(&app);
         }
         let _ = app.emit("setting-changed", serde_json::json!({ "key": key, "value": value }));
         #[cfg(feature = "online")]
@@ -761,7 +901,7 @@ fn is_admin() -> bool {
 }
 
 #[tauri::command]
-fn set_language(state: tauri::State<'_, AppState>, language: String) {
+fn set_language(app: tauri::AppHandle, state: tauri::State<'_, AppState>, language: String) {
     tracing::info!("Language change requested: {}", language);
     if let Some(ref data_dir) = state.i18n_data_dir {
         i18n::lookup::load_language(&state.skill_lookup, &state.npc_lookup, data_dir, &language);
@@ -769,6 +909,7 @@ fn set_language(state: tauri::State<'_, AppState>, language: String) {
         tracing::warn!("No i18n data dir available for language reload");
     }
     state.settings.set("dpsMeter.language", &language);
+    crate::plugins::broadcast(&app, "language", serde_json::Value::String(language));
 }
 
 #[tauri::command]
@@ -2509,6 +2650,10 @@ pub fn run() {
             })
             .build())
         .plugin(tauri_plugin_process::init())
+        // Plugin files, each plugin's own origin (crate::plugins::serve).
+        .register_uri_scheme_protocol(crate::plugins::SCHEME, |ctx, request| {
+            crate::plugins::serve(ctx.app_handle(), request.uri().path())
+        })
         // Closing the meter quits, even with Details, History or a kept
         // Settings window still open.
         .on_window_event(|window, event| {
@@ -2738,73 +2883,17 @@ pub fn run() {
                 dispatcher.run(rx).await;
             });
 
-            // Register global hotkeys from saved settings (or defaults)
-            let hotkey_handle = app.handle().clone();
-            let hotkey_manager = platform::hotkeys::HotkeyManager::new();
+            // Global hotkeys, unless turned off (or, on Linux, not yet on).
+            // Plugins: the installed ones, and developer-mode folders (crate::plugins).
+            let plugin_host = std::sync::Arc::new(crate::plugins::PluginHost::default());
+            app.manage(std::sync::Arc::clone(&plugin_host));
+            plugin_host.reload(app.handle());
 
-            let reload_label = app.state::<AppState>().settings
-                .get("dpsMeter.hotkey").unwrap_or_default();
-            let toggle_label = app.state::<AppState>().settings
-                .get("dpsMeter.toggleWindowHotkey").unwrap_or_default();
-            let lock_label = app.state::<AppState>().settings
-                .get("dpsMeter.lockHotkey").unwrap_or_default();
-
-            let (reload_mods, reload_vk) = platform::hotkeys::parse_hotkey_label(&reload_label)
-                .unwrap_or((0x0002 | 0x0001, 0x52)); // Default: Ctrl+Alt+R
-            let (toggle_mods, toggle_vk) = platform::hotkeys::parse_hotkey_label(&toggle_label)
-                .unwrap_or((0x0002 | 0x0001, 0x26)); // Default: Ctrl+Alt+Up
-            let (lock_mods, lock_vk) = platform::hotkeys::parse_hotkey_label(&lock_label)
-                .unwrap_or((0x0002 | 0x0001, 0x4C)); // Default: Ctrl+Alt+L
-
-            hotkey_manager.start(
-                reload_mods, reload_vk,
-                toggle_mods, toggle_vk,
-                lock_mods, lock_vk,
-                {
-                    let h = hotkey_handle.clone();
-                    move || {
-                        tracing::info!("Hotkey: reload triggered");
-                        save_fights_before_reset(&h);
-                        if let Some(state) = h.try_state::<AppState>() {
-                            state.dps_calculator.lock().restart_target_selection(true);
-                            state.data_storage.forget_guessed_nicknames();
-                        }
-                        // Notify frontend to clear UI
-                        let _ = h.emit("combat-reset", ());
-                        let _ = h.emit("dps-update", &entity::dps_data::DpsData::new());
-                    }
-                },
-                {
-                    let h = hotkey_handle.clone();
-                    move || {
-                        // Toggle window visibility
-                        if let Some(window) = h.get_webview_window("main") {
-                            if window.is_visible().unwrap_or(false) {
-                                let _ = window.hide();
-                            } else {
-                                let _ = window.show();
-                                let _ = window.set_always_on_top(true);
-                                let _ = window.set_focus();
-                            }
-                        }
-                    }
-                },
-                {
-                    let h = hotkey_handle;
-                    move || {
-                        // Toggle the click-through lock, and tell the page so
-                        // its button and saved setting follow.
-                        let locked = h
-                            .try_state::<AppState>()
-                            .is_some_and(|s| s.overlay_lock.locked.load(std::sync::atomic::Ordering::SeqCst));
-                        if platform::window::cursor_position().is_none() && !locked {
-                            return; // the lock is not offered here
-                        }
-                        apply_overlay_lock(&h, !locked);
-                        let _ = h.emit("overlay-lock-changed", !locked);
-                    }
-                },
-            );
+            app.manage(Hotkeys {
+                manager: platform::hotkeys::HotkeyManager::new(),
+                status: Arc::new(Mutex::new(HashMap::new())),
+            });
+            apply_global_hotkeys(app.handle());
 
             // Periodic DPS update emission (every 500ms)
             let handle = app.handle().clone();
@@ -3160,6 +3249,20 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             get_app_version,
+            get_hotkey_status,
+            crate::plugins::plugin_list,
+            crate::plugins::plugin_set_dev_mode,
+            crate::plugins::plugin_add_folder,
+            crate::plugins::plugin_remove_folder,
+            crate::plugins::plugin_check_updates,
+            crate::plugins::plugin_catalog,
+            crate::plugins::plugin_install,
+            crate::plugins::plugin_uninstall,
+            crate::plugins::plugin_debug_frame,
+            crate::plugins::plugin_open,
+            crate::plugins::plugin_hello,
+            crate::plugins::plugin_storage_get,
+            crate::plugins::plugin_storage_set,
             get_dps_snapshot,
             get_skill_details,
             get_details_context,

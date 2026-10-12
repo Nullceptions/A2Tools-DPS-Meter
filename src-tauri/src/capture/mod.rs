@@ -2,6 +2,7 @@
 pub mod abnormal;
 pub mod captured_payload;
 pub mod evidence_slice;
+pub mod frame_tap;
 pub mod framing;
 pub mod packet_accumulator;
 pub mod stream_assembler;

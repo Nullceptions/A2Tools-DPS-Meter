@@ -33,6 +33,8 @@ settings.properties
 
 # Copied static files (generated from src/ at build/dev time)
 /public/*
+# The plugin windows' host page (src-tauri/src/plugins).
+!/public/plugin-host.html
 !/public/src/
 /public/src/*
 !/public/src/js/
@@ -62,3 +64,6 @@ settings.properties
 /packaging/arch/src/
 /packaging/arch/pkg/
 /packaging/arch/*.pkg.tar.zst
+
+# Never commit a signing key.
+*.pem

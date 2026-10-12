@@ -1,0 +1,16 @@
+{
+  "bundle": {
+    "linux": {
+      "deb": {
+        "files": {
+          "/usr/bin/a2tools-hotkeys": "target/release/a2tools-hotkeys"
+        }
+      },
+      "rpm": {
+        "files": {
+          "/usr/bin/a2tools-hotkeys": "target/release/a2tools-hotkeys"
+        }
+      }
+    }
+  }
+}

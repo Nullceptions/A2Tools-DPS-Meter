@@ -211,7 +211,7 @@ To remove it:
 | A2 Tools account sign-in | Works: kept in KWallet or GNOME Keyring, which may ask to create or unlock a wallet the first time |
 | Automatic updates | Works for the packages; builds from source update with `git pull` |
 | Class icons | Works (missing in the 2.0.34 package and earlier; fixed in 2.0.35) |
-| Global hotkeys | From 2.0.57, through your desktop's global shortcuts: see [Global hotkeys](#global-hotkeys) |
+| Global hotkeys | From 2.0.59, once turned on in Settings → Keybinds, through your desktop's global shortcuts: see [Global hotkeys](#global-hotkeys) |
 | Click-through lock | From 2.0.42, when the meter runs through XWayland (`GDK_BACKEND=x11 a2tools-dps-meter`): turn on the lock button in Settings. On native Wayland an app cannot see where the pointer is outside its own window, so the button stays hidden there |
 | Discord activity | From 2.0.42: your class, level and server in your Discord status, through the Discord app on the same computer |
 | Screenshots | Works from 2.0.41, to the clipboard and a folder (`~/Pictures/A2Tools DPS Meter` by default). On Linux the meter pictures itself on a plain background, since Wayland lets no app copy the screen |
@@ -219,7 +219,9 @@ To remove it:
 
 ## Global hotkeys
 
-From 2.0.57 the meter's three hotkeys (reset, show or hide, click-through lock) work on Linux through your desktop's global shortcuts. Wayland lets no app grab keys itself, so the meter asks the desktop for them, and the desktop has the final say on which keys they use. The meter suggests the keys set under **Settings → Keybinds**.
+From 2.0.59 the meter's three hotkeys (reset, show or hide, click-through lock) work on Linux through your desktop's global shortcuts. They are off until you turn on **Use keybinds** under **Settings → Keybinds**; turning it on registers them at once, and turning it off releases them. Wayland lets no app grab keys itself, so the meter asks the desktop for them, and the desktop has the final say on which keys they use. The meter suggests the keys set on the same tab.
+
+The keys are registered by a small helper, `a2tools-hotkeys`, installed next to the meter. The meter itself holds the permission to capture packets (`cap_net_raw`), and Linux will not let the desktop's shortcut service read a program holding a permission the service does not have, so the meter cannot register shortcuts itself. The helper has no such permission and only handles keybinds. They are off by default because your desktop may ask you to approve them.
 
 | Desktop | What happens |
 | --- | --- |

@@ -22,6 +22,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
+use sha2::Digest;
 use serde_json::Value;
 use tauri::{Emitter, Manager};
 
@@ -35,8 +36,13 @@ pub const DEV_FOLDERS_KEY: &str = "dpsMeter.devPlugins";
 /// The scheme plugin files are served from (`http://a2plugin.localhost/` on
 /// Windows, `a2plugin://localhost/` elsewhere).
 pub const SCHEME: &str = "a2plugin";
-/// The plugin API version this meter speaks.
-const API_VERSION: u32 = 1;
+/// The newest plugin API this meter speaks; it runs older ones too.
+/// 2 added decoders' `self` field and `a2.window` (the `window` permission).
+const API_VERSION: u32 = 2;
+/// Which plugin windows were open, and whether hidden, when the meter last
+/// ran: a JSON object of id → "shown" | "hidden". They open again at start, so
+/// a plugin that watches in the background (hidden) keeps doing so.
+pub const WINDOWS_KEY: &str = "dpsMeter.pluginWindows";
 /// Largest value one storage key may hold.
 const MAX_STORED: usize = 1024 * 1024;
 /// How long a decoded event waits before it is stamped with the character and
@@ -177,8 +183,8 @@ fn load_folder(dir: &Path) -> Result<Loaded, String> {
     if !valid_id(&manifest.id) {
         return Err(format!("id {:?}: lowercase letters, digits and '-' only", manifest.id));
     }
-    if manifest.api_version != API_VERSION {
-        return Err(format!("apiVersion {} (this meter speaks {API_VERSION})", manifest.api_version));
+    if manifest.api_version == 0 || manifest.api_version > API_VERSION {
+        return Err(format!("apiVersion {} (this meter speaks up to {API_VERSION}): update the meter", manifest.api_version));
     }
     if !dir.join("index.html").is_file() {
         return Err("no index.html".into());
@@ -279,11 +285,18 @@ impl PluginHost {
         let at = len as usize;
         let Some(opcode) = packet.get(at..at + 2) else { return };
         let body = &packet[at + 2..];
-        let _ = app;
         let loaded = self.loaded.read().unwrap_or_else(|p| p.into_inner());
         for plugin in loaded.iter() {
             for d in plugin.decoders.iter().filter(|d| d.opcode == opcode) {
                 let Some(data) = d.decode(body) else { continue };
+                // Only the player's own doings, for a decoder that asks so.
+                if let Some(field) = &d.self_field {
+                    let me = app.try_state::<AppState>().and_then(|s| s.data_storage.local_player_id());
+                    let theirs = data.get(field).and_then(Value::as_i64);
+                    if me.is_none() || me != theirs {
+                        continue;
+                    }
+                }
                 self.pending.lock().unwrap_or_else(|p| p.into_inner()).push(Pending {
                     at: Instant::now(),
                     plugin: plugin.manifest.id.clone(),
@@ -597,6 +610,7 @@ pub fn plugin_uninstall(app: tauri::AppHandle, id: String) -> Result<PluginsView
     if let Some(window) = app.get_webview_window(&format!("plugin-{id}")) {
         let _ = window.close();
     }
+    remember_window(&app, &id, None);
     let dir = plugins_dir(&app)?.join(&id);
     if dir.is_dir() {
         std::fs::remove_dir_all(&dir).map_err(|e| e.to_string())?;
@@ -622,13 +636,24 @@ pub fn plugin_remove_folder(app: tauri::AppHandle, path: String) -> Result<Plugi
     Ok(view(&app, &host))
 }
 
-/// Open a plugin's window.
-/// Async: on Windows, building a window from a synchronous command deadlocks.
-#[tauri::command]
-pub async fn plugin_open(app: tauri::AppHandle, id: String) -> Result<(), String> {
-    let host = host(&app)?;
+/// Remember a plugin window's state for the next start (`None`: closed).
+fn remember_window(app: &tauri::AppHandle, id: &str, state: Option<&str>) {
+    let Some(settings) = app.try_state::<AppState>() else { return };
+    let mut windows: serde_json::Map<String, Value> =
+        settings.settings.get(WINDOWS_KEY).and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+    match state {
+        Some(state) => windows.insert(id.to_string(), Value::String(state.into())),
+        None => windows.remove(id),
+    };
+    settings.settings.set(WINDOWS_KEY, &Value::Object(windows).to_string());
+}
+
+/// Build (or show) a plugin's window; `visible: false` builds it hidden, for a
+/// plugin restored at start that was watching in the background.
+fn open_window(app: &tauri::AppHandle, id: &str, visible: bool) -> Result<(), String> {
+    let host = host(app)?;
     let (name, width, height) = host
-        .with(&id, |l| {
+        .with(id, |l| {
             let panel = l.manifest.ui.as_ref().and_then(|u| u.get("panel"));
             let dim = |key: &str, default: f64| {
                 panel.and_then(|p| p.get(key)).and_then(Value::as_f64).unwrap_or(default).clamp(240.0, 1200.0)
@@ -638,18 +663,21 @@ pub async fn plugin_open(app: tauri::AppHandle, id: String) -> Result<(), String
         .ok_or("no such plugin")?;
     let label = format!("plugin-{id}");
     if let Some(window) = app.get_webview_window(&label) {
-        let _ = window.show();
-        let _ = window.set_focus();
+        if visible {
+            let _ = window.show();
+            let _ = window.set_focus();
+        }
         return Ok(());
     }
-    tauri::WebviewWindowBuilder::new(&app, &label, tauri::WebviewUrl::App("plugin-host.html".into()))
-        .initialization_script(format!("window.__A2_PLUGIN_ID__ = {};", serde_json::to_string(&id).unwrap_or_default()))
+    tauri::WebviewWindowBuilder::new(app, &label, tauri::WebviewUrl::App("plugin-host.html".into()))
+        .initialization_script(format!("window.__A2_PLUGIN_ID__ = {};", serde_json::to_string(id).unwrap_or_default()))
         .title(format!("{name} (plugin)"))
         .inner_size(width, height + 30.0)
         .min_inner_size(240.0, 200.0)
         .decorations(false)
         .always_on_top(true)
         .resizable(true)
+        .visible(visible)
         // Transparent, so the panel's opacity slider shows the game through it.
         .transparent(true)
         // No system border or shadow (Windows 11 draws both on a frameless
@@ -658,6 +686,54 @@ pub async fn plugin_open(app: tauri::AppHandle, id: String) -> Result<(), String
         .build()
         .map(|_| ())
         .map_err(|e| e.to_string())
+}
+
+/// Open a plugin's window.
+/// Async: on Windows, building a window from a synchronous command deadlocks.
+#[tauri::command]
+pub async fn plugin_open(app: tauri::AppHandle, id: String) -> Result<(), String> {
+    open_window(&app, &id, true)?;
+    remember_window(&app, &id, Some("shown"));
+    Ok(())
+}
+
+/// Open again the plugin windows that were open when the meter last closed.
+pub fn restore_windows(app: &tauri::AppHandle) {
+    let Some(state) = app.try_state::<AppState>() else { return };
+    let windows: serde_json::Map<String, Value> =
+        state.settings.get(WINDOWS_KEY).and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+    for (id, how) in windows {
+        let visible = how.as_str() != Some("hidden");
+        if let Err(e) = open_window(app, &id, visible) {
+            tracing::info!("Plugins: not reopening {id}: {e}");
+            remember_window(app, &id, None);
+        }
+    }
+}
+
+/// A plugin shows or hides its own window (`window` permission), for one that
+/// watches in the background and appears only when it has something to say.
+/// Shown on top without taking focus from the game.
+#[tauri::command]
+pub fn plugin_window(app: tauri::AppHandle, window: tauri::WebviewWindow, visible: bool) -> Result<(), String> {
+    let id = window_plugin(&window)?;
+    require(&app, &id, "window")?;
+    if visible {
+        crate::platform::window::show_on_top_without_focus(&window);
+    } else {
+        let _ = window.hide();
+    }
+    remember_window(&app, &id, Some(if visible { "shown" } else { "hidden" }));
+    Ok(())
+}
+
+/// The window's close button: close it, and don't reopen it at the next start.
+#[tauri::command]
+pub fn plugin_close(app: tauri::AppHandle, window: tauri::WebviewWindow) -> Result<(), String> {
+    let id = window_plugin(&window)?;
+    remember_window(&app, &id, None);
+    let _ = window.close();
+    Ok(())
 }
 
 // ── Plugin windows ─────────────────────────────────────────────────────────
@@ -794,6 +870,26 @@ pub fn serve(app: &tauri::AppHandle, path: &str) -> tauri::http::Response<Vec<u8
     if !file.starts_with(&root) || !file.is_file() {
         return respond(404, "text/plain", Vec::new());
     }
+    // On Linux a plugin page gets its scripts, styles and images inlined:
+    // WebKitGTK (2.54 at least) refuses every file a sandboxed frame (an
+    // opaque origin) asks for from a custom scheme ("Unsafe attempt to load
+    // URL … from origin null"), before the page's policy is even consulted,
+    // so plugins showed their bare HTML and nothing ran (2.0.60, 2.0.61).
+    // Inlining keeps the frame's opaque-origin sandbox, which
+    // `allow-same-origin` (the other way out) would give up.
+    if !cfg!(windows) && file.extension().is_some_and(|e| e == "html") {
+        if let Ok(html) = std::fs::read_to_string(&file) {
+            let (page, hashes) = inline_page(&html, &root, file.parent().unwrap_or(&root));
+            let policy = inlined_policy(id, &hashes);
+            return tauri::http::Response::builder()
+                .status(200)
+                .header("Content-Type", "text/html; charset=utf-8")
+                .header("Content-Security-Policy", policy.as_str())
+                .header("X-Content-Type-Options", "nosniff")
+                .body(page.into_bytes())
+                .unwrap_or_default();
+        }
+    }
     let kind = match file.extension().and_then(|e| e.to_str()).unwrap_or("") {
         "html" => "text/html; charset=utf-8",
         "js" => "text/javascript; charset=utf-8",
@@ -810,6 +906,125 @@ pub fn serve(app: &tauri::AppHandle, path: &str) -> tauri::http::Response<Vec<u8
         Ok(body) => respond(200, kind, body),
         Err(_) => respond(404, "text/plain", Vec::new()),
     }
+}
+
+/// A plugin page with its `<script src>`, stylesheet `<link>` and `<img src>`
+/// replaced by the files themselves (images as `data:` URLs), and the SHA-256
+/// of each inlined script for the policy. Only the SDK and files inside the
+/// plugin's folder are inlined; any other tag is left as it is (and stays
+/// refused).
+fn inline_page(html: &str, root: &Path, page_dir: &Path) -> (String, Vec<String>) {
+    let file_of = |src: &str| -> Option<PathBuf> {
+        if src.contains(':') || src.starts_with('/') {
+            return None;
+        }
+        let file = page_dir.join(percent_decode(src.split(['?', '#']).next()?)).canonicalize().ok()?;
+        file.starts_with(root).then_some(file)
+    };
+    let read = |src: &str| -> Option<String> {
+        if src.trim_start_matches('/') == "_sdk/a2.js" {
+            return Some(SDK.to_string());
+        }
+        std::fs::read_to_string(file_of(src)?).ok()
+    };
+    let image = |src: &str| -> Option<String> {
+        let file = file_of(src)?;
+        let kind = match file.extension()?.to_str()? {
+            "png" => "image/png",
+            "svg" => "image/svg+xml",
+            "webp" => "image/webp",
+            "gif" => "image/gif",
+            "jpg" | "jpeg" => "image/jpeg",
+            _ => return None,
+        };
+        Some(format!("data:{kind};base64,{}", base64(&std::fs::read(file).ok()?)))
+    };
+    let mut out = String::with_capacity(html.len() * 2);
+    let mut hashes = Vec::new();
+    let mut rest = html;
+    while let Some(start) = rest.find('<') {
+        out.push_str(&rest[..start]);
+        rest = &rest[start..];
+        let Some(end) = rest.find('>') else { break };
+        let tag = &rest[..=end];
+        let lower = tag.to_ascii_lowercase();
+        if lower.starts_with("<script") && rest[end + 1..].to_ascii_lowercase().starts_with("</script>") {
+            if let Some(code) = attribute(tag, "src").and_then(|src| read(&src)) {
+                // "</script" inside the code would end the element early.
+                let code = code.replace("</script", "<\\/script");
+                hashes.push(base64(&sha2::Sha256::digest(code.as_bytes())));
+                out.push_str("<script>");
+                out.push_str(&code);
+                out.push_str("</script>");
+                rest = &rest[end + 1 + "</script>".len()..];
+                continue;
+            }
+        } else if lower.starts_with("<link") && attribute(tag, "rel").is_some_and(|r| r.eq_ignore_ascii_case("stylesheet")) {
+            if let Some(css) = attribute(tag, "href").and_then(|href| read(&href)) {
+                out.push_str("<style>");
+                out.push_str(&css.replace("</style", "<\\/style"));
+                out.push_str("</style>");
+                rest = &rest[end + 1..];
+                continue;
+            }
+        } else if lower.starts_with("<img") {
+            if let Some((src, data)) = attribute(tag, "src").and_then(|src| image(&src).map(|d| (src, d))) {
+                out.push_str(&tag.replacen(&src, &data, 1));
+                rest = &rest[end + 1..];
+                continue;
+            }
+        }
+        out.push_str(tag);
+        rest = &rest[end + 1..];
+    }
+    out.push_str(rest);
+    (out, hashes)
+}
+
+/// An attribute's value in an opening tag, quoted or not.
+fn attribute(tag: &str, name: &str) -> Option<String> {
+    let lower = tag.to_ascii_lowercase();
+    let mut from = 0;
+    while let Some(i) = lower[from..].find(name) {
+        let at = from + i;
+        from = at + name.len();
+        if !lower[..at].chars().last().is_some_and(char::is_whitespace) {
+            continue;
+        }
+        let Some(after) = tag[from..].trim_start().strip_prefix('=') else { continue };
+        let after = after.trim_start();
+        let value = match after.chars().next()? {
+            q @ ('"' | '\'') => after[1..].split(q).next()?,
+            _ => after.split(|c: char| c.is_whitespace() || c == '>' || c == '/').next()?,
+        };
+        return Some(value.to_string());
+    }
+    None
+}
+
+/// Standard base64, with padding.
+fn base64(data: &[u8]) -> String {
+    const ABC: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let n = chunk.iter().enumerate().fold(0u32, |n, (i, &b)| n | u32::from(b) << (16 - 8 * i));
+        for i in 0..4 {
+            out.push(if i <= chunk.len() { ABC[(n >> (18 - 6 * i) & 63) as usize] as char } else { '=' });
+        }
+    }
+    out
+}
+
+/// The policy for an inlined page: only its own inlined scripts run (by
+/// hash), its inlined styles apply, and nothing loads from anywhere.
+fn inlined_policy(id: &str, hashes: &[String]) -> String {
+    let scripts: String = hashes.iter().map(|h| format!(" 'sha256-{h}'")).collect();
+    let own = if valid_id(id) { format!("a2plugin://localhost/{id}/") } else { "'none'".into() };
+    format!(
+        "default-src 'none'; script-src{}; style-src 'unsafe-inline'; img-src {own} data:; font-src {own} data:; \
+         connect-src 'none'; frame-src 'none'; base-uri 'none'; form-action 'none'",
+        if scripts.is_empty() { " 'none'".to_string() } else { scripts }
+    )
 }
 
 fn percent_decode(s: &str) -> String {
@@ -832,7 +1047,48 @@ fn percent_decode(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::content_policy;
+    use super::{base64, content_policy, inline_page, inlined_policy};
+
+    #[test]
+    fn a_page_gets_its_own_scripts_styles_and_images_inlined() {
+        let dir = std::env::temp_dir().join(format!("a2plugin-inline-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("plugin")).unwrap();
+        std::fs::write(dir.join("plugin/plugin.js"), "go('</script>');").unwrap();
+        std::fs::write(dir.join("plugin/style.css"), "body{color:red}").unwrap();
+        std::fs::write(dir.join("plugin/dot.png"), [1u8, 2, 3]).unwrap();
+        std::fs::write(dir.join("secret.js"), "nope").unwrap();
+        let root = dir.join("plugin").canonicalize().unwrap();
+        let html = concat!(
+            "<link rel=\"stylesheet\" href=\"style.css\" />",
+            "<script src=\"/_sdk/a2.js\"></script>",
+            "<script src=\"plugin.js\"></script>",
+            "<script src=\"../secret.js\"></script>",
+            "<script src=\"https://example.com/x.js\"></script>",
+            "<img alt=\"\" src=\"dot.png\">",
+        );
+        let (page, hashes) = inline_page(html, &root, &root);
+        assert!(page.contains("<style>body{color:red}</style>"), "{page}");
+        assert!(page.contains("window.a2 = Object.freeze"), "the SDK");
+        assert!(page.contains("<script>go('<\\/script>');</script>"), "{page}");
+        assert!(page.contains("src=\"data:image/png;base64,AQID\""), "{page}");
+        // Outside the folder or elsewhere: left as a tag, which the policy refuses.
+        assert!(page.contains("<script src=\"../secret.js\"></script>"));
+        assert!(page.contains("https://example.com/x.js"));
+        assert_eq!(hashes.len(), 2);
+        let policy = inlined_policy("plugin", &hashes);
+        assert!(policy.contains(&format!("script-src 'sha256-{}' 'sha256-{}';", hashes[0], hashes[1])), "{policy}");
+        assert!(policy.contains("connect-src 'none'"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn base64_of_a_sha256() {
+        use sha2::Digest;
+        // printf abc | sha256sum | xxd -r -p | base64
+        assert_eq!(base64(&sha2::Sha256::digest(b"abc")), "ungWv48Bz+pBQUDeXa4iI7ADYaOWF3qctBD/YfIAFa0=");
+        assert_eq!(base64(b"ab"), "YWI=");
+    }
 
     #[test]
     fn the_policy_names_the_plugins_own_files() {

@@ -435,6 +435,7 @@
       "consentCancel": "Cancelar",
       "permStorage": "Salvar os próprios dados neste computador",
       "permNotify": "Mostrar mensagens curtas na sua janela",
+      "permWindow": "Mostrar e ocultar a própria janela, sem tirar o foco do jogo",
       "permCharacter": "Ver nome, servidor, classe e nível do seu personagem",
       "permDecoder": "Ler seus próprios dados do jogo: {name}",
       "permNone": "Nada além de mostrar sua janela"

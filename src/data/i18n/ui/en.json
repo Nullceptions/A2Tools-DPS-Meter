@@ -447,6 +447,7 @@
       "consentCancel": "Cancel",
       "permStorage": "Save its own data on this computer",
       "permNotify": "Show short messages in its window",
+      "permWindow": "Show and hide its own window, without taking focus from the game",
       "permCharacter": "See your character's name, server, class and level",
       "permDecoder": "Read your own game data: {name}",
       "permNone": "Nothing beyond showing its window"

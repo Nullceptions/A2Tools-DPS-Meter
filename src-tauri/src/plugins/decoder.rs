@@ -13,6 +13,11 @@
 //! `skip:N`, and `list` (a `count` of `u8`, `u16`, `u32` or `varint`, then that
 //! many entries of the list's own `fields`). Numbers only: there is no string
 //! type, so no name can be read out of a frame.
+//!
+//! `"self": "<field>"` (plugin API 2) names a top-level number field that holds
+//! an entity id: the meter passes the event on only when that entity is the
+//! player's own character, so a plugin can tell "I did this" without ever
+//! seeing anyone else's id.
 
 use serde::Deserialize;
 use serde_json::{Map, Value};
@@ -30,6 +35,9 @@ pub struct DecoderSpec {
     /// Two bytes in hex, as frames are logged: `"0D 90"`.
     pub opcode: String,
     pub fields: Vec<FieldSpec>,
+    /// A field that must be the player's own entity id (see the module docs).
+    #[serde(default, rename = "self")]
+    pub self_field: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -52,6 +60,8 @@ pub struct Decoder {
     pub name: String,
     pub opcode: [u8; 2],
     fields: Vec<FieldSpec>,
+    /// The field that must be the player's own entity id, if any.
+    pub self_field: Option<String>,
 }
 
 impl Decoder {
@@ -74,7 +84,15 @@ impl Decoder {
             .try_into()
             .map_err(|_| format!("decoder {}: opcode must be two bytes", spec.name))?;
         check_fields(&spec.fields, 0).map_err(|e| format!("decoder {}: {e}", spec.name))?;
-        Ok(Self { name: spec.name.clone(), opcode, fields: spec.fields.clone() })
+        if let Some(field) = &spec.self_field {
+            let ok = spec.fields.iter().any(|f| {
+                f.name.as_deref() == Some(field.as_str()) && matches!(f.kind.as_str(), "u16" | "u32" | "u64" | "varint")
+            });
+            if !ok {
+                return Err(format!("decoder {}: \"self\" must name one of its number fields", spec.name));
+            }
+        }
+        Ok(Self { name: spec.name.clone(), opcode, fields: spec.fields.clone(), self_field: spec.self_field.clone() })
     }
 
     /// Decode a frame's body (the bytes after its type) into the fields.

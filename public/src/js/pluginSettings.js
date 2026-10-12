@@ -42,6 +42,9 @@
     const describe = (permission) => {
       if (permission === "storage") return t("settings.plugins.permStorage", "Save its own data on this computer");
       if (permission === "notify") return t("settings.plugins.permNotify", "Show short messages in its window");
+      if (permission === "window") {
+        return t("settings.plugins.permWindow", "Show and hide its own window, without taking focus from the game");
+      }
       if (permission === "events:character") {
         return t("settings.plugins.permCharacter", "See your character's name, server, class and level");
       }

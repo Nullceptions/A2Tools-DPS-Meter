@@ -142,7 +142,7 @@ pub async fn install(http: &reqwest::Client, entry: &Entry, plugins_dir: &Path) 
     if !super::valid_id(&entry.id) {
         return Err(format!("plugin id {:?} is not valid", entry.id));
     }
-    if entry.api_version != super::API_VERSION {
+    if entry.api_version == 0 || entry.api_version > super::API_VERSION {
         return Err(format!("{} needs a newer meter (plugin API {})", entry.name, entry.api_version));
     }
     if !entry.files.contains_key("manifest.json") || !entry.files.contains_key("index.html") {

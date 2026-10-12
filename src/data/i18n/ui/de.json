@@ -435,6 +435,7 @@
       "consentCancel": "Abbrechen",
       "permStorage": "Eigene Daten auf diesem Computer speichern",
       "permNotify": "Kurze Meldungen in seinem Fenster anzeigen",
+      "permWindow": "Sein eigenes Fenster ein- und ausblenden, ohne dem Spiel den Fokus zu nehmen",
       "permCharacter": "Name, Server, Klasse und Stufe deines Charakters sehen",
       "permDecoder": "Deine eigenen Spieldaten lesen: {name}",
       "permNone": "Nichts außer sein Fenster anzuzeigen"

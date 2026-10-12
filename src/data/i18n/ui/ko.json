@@ -442,6 +442,7 @@
       "consentCancel": "취소",
       "permStorage": "이 컴퓨터에 자체 데이터 저장",
       "permNotify": "자체 창에 짧은 메시지 표시",
+      "permWindow": "게임의 포커스를 빼앗지 않고 자체 창을 표시하거나 숨기기",
       "permCharacter": "캐릭터의 이름, 서버, 클래스, 레벨 보기",
       "permDecoder": "내 게임 데이터 읽기: {name}",
       "permNone": "창을 표시하는 것 외에는 없음"

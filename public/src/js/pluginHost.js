@@ -60,6 +60,14 @@
     },
     "storage.get": ([key]) => invoke("plugin_storage_get", { key: String(key) }),
     "storage.set": ([key, value]) => invoke("plugin_storage_set", { key: String(key), value: String(value) }),
+    "window.show": () => {
+      if (!allowed("window")) throw new Error('the plugin lacks the "window" permission');
+      return invoke("plugin_window", { visible: true });
+    },
+    "window.hide": () => {
+      if (!allowed("window")) throw new Error('the plugin lacks the "window" permission');
+      return invoke("plugin_window", { visible: false });
+    },
     notify: ([text]) => {
       if (!allowed("notify")) throw new Error('the plugin lacks the "notify" permission');
       showToast(String(text));
@@ -87,7 +95,9 @@
     invoke("start_tool_drag").catch(() => {});
   });
   document.querySelector(".pluginClose").addEventListener("click", () => {
-    invoke("close_tool_window").catch(() => {});
+    // Closed here, it stays closed at the next start (unlike a window the
+    // plugin hid, which comes back hidden and keeps watching).
+    invoke("plugin_close").catch(() => {});
   });
 
   // Panel preferences, per plugin, kept by this page: background opacity, and

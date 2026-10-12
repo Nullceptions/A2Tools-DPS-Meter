@@ -16,6 +16,8 @@
 //   await a2.storage.get("state")              the plugin's own saved data
 //   await a2.storage.set("state", value)
 //   a2.notify("Text")                          a short message in the plugin's window
+//   a2.window.show() / a2.window.hide()        its own window, shown on top without taking focus
+//                                              (permission "window", plugin API 2)
 //   a2.ready()                                 call once the handlers are set
 (() => {
   const handlers = {};
@@ -57,6 +59,10 @@
       set: (key, value) => call("storage.set", [key, JSON.stringify(value)]),
     }),
     notify: (text) => call("notify", [String(text)]),
+    window: Object.freeze({
+      show: () => call("window.show", []),
+      hide: () => call("window.hide", []),
+    }),
     ready: () => call("ready", []),
   });
 })();

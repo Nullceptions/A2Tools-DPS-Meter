@@ -442,6 +442,7 @@
       "consentCancel": "取消",
       "permStorage": "在此電腦上儲存自己的資料",
       "permNotify": "在自己的視窗中顯示簡短訊息",
+      "permWindow": "顯示和隱藏自己的視窗，不會搶走遊戲的焦點",
       "permCharacter": "查看你角色的名稱、伺服器、職業和等級",
       "permDecoder": "讀取你自己的遊戲資料：{name}",
       "permNone": "除顯示視窗外不做其他事"

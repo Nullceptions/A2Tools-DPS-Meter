@@ -10,8 +10,6 @@
 //   a2.on("character", (c) => ...)             your character (name, serverId, class, level)
 //   a2.on("language", (code) => ...)           the meter's language ("en", "ko", "zh-Hans", ...), at start and on change
 //   a2.on("compact", (on) => ...)              the window's fold button: show only the essentials
-//   a2.on("mode", (mode) => ...)               "popup" or "panel" (see a2.show), at start and on change
-//   a2.on("dismissed", () => ...)              the user closed the pop-up: show again only for something new
 //
 // Keep the page's background transparent: the window paints the panel at the
 // opacity the user picks.
@@ -19,12 +17,6 @@
 //   await a2.storage.set("state", value)
 //   a2.notify("Text")                          a short message in the plugin's window
 //   a2.ready()                                 call once the handlers are set
-//
-// With the "popup" permission the plugin runs from the meter's start in a
-// pop-up: a small window, hidden until the plugin shows it, that never takes
-// focus from the game. Opened from Settings it is a panel instead (mode event).
-//   a2.show() / a2.hide()                      show or hide the pop-up (no effect on a panel)
-//   a2.fit(height)                             size the pop-up to the content's height in pixels
 (() => {
   const handlers = {};
   const pending = new Map();
@@ -66,8 +58,5 @@
     }),
     notify: (text) => call("notify", [String(text)]),
     ready: () => call("ready", []),
-    show: () => call("show", []),
-    hide: () => call("hide", []),
-    fit: (height) => call("fit", [Number(height)]),
   });
 })();

@@ -12,9 +12,6 @@
   let manifest = null;
   let ready = false;
   const queue = [];
-  // A pop-up (hidden until the plugin shows it, sized to what it shows) or a
-  // panel the user opened from Settings. The meter says which.
-  let popup = false;
 
   const allowed = (permission) => !!manifest?.permissions?.includes(permission);
   const send = (msg) => frame?.contentWindow?.postMessage({ a2: 1, ...msg }, "*");
@@ -65,31 +62,10 @@
     "storage.set": ([key, value]) => invoke("plugin_storage_set", { key: String(key), value: String(value) }),
     notify: ([text]) => {
       if (!allowed("notify")) throw new Error('the plugin lacks the "notify" permission');
-      if (!popup) showToast(String(text));
+      showToast(String(text));
       return true;
     },
-    // Pop-up only; a panel stays as the user left it (the calls answer false).
-    show: () => popupCall({ show: true }),
-    hide: () => popupCall({ show: false }),
-    fit: ([height]) => {
-      const content = Number(height);
-      if (!Number.isFinite(content) || content <= 0) throw new Error("fit needs the content's height in pixels");
-      const chrome = document.querySelector(".pluginBar").offsetHeight + 2;
-      return popupCall({ height: Math.ceil(content) + chrome });
-    },
   };
-  const popupCall = (args) => {
-    if (!allowed("popup")) throw new Error('the plugin lacks the "popup" permission');
-    if (!popup) return false;
-    return invoke("plugin_popup", args);
-  };
-  const setMode = (isPopup) => {
-    popup = isPopup;
-    document.body.classList.toggle("popup", popup);
-    if (popup) toast.hidden = true;
-    deliver("mode", popup ? "popup" : "panel");
-  };
-  listen("plugin-mode", (event) => setMode(event.payload === "popup"));
 
   window.addEventListener("message", async (event) => {
     if (!frame || event.source !== frame.contentWindow) return;
@@ -110,16 +86,8 @@
     e.preventDefault();
     invoke("start_tool_drag").catch(() => {});
   });
-  // A pop-up's close button dismisses what it shows (the plugin hears
-  // "dismissed" and pops up again for something new); a panel closes, or goes
-  // back to being its plugin's pop-up.
   document.querySelector(".pluginClose").addEventListener("click", () => {
-    if (popup) {
-      invoke("plugin_popup", { show: false }).catch(() => {});
-      deliver("dismissed", true);
-    } else {
-      invoke("plugin_close").catch(() => invoke("close_tool_window").catch(() => {}));
-    }
+    invoke("close_tool_window").catch(() => {});
   });
 
   // Panel preferences, per plugin, kept by this page: background opacity, and
@@ -168,10 +136,6 @@
     // Reviewed plugins come from the signed catalog; anything else is a developer folder.
     document.querySelector(".pluginBadge").hidden = !!hello.reviewed;
     deliver("language", hello.language || "en");
-    setMode(!!hello.popup);
-    // On Windows a pop-up starts shown (so that it loads); hide it until the
-    // plugin has something to show.
-    if (popup) invoke("plugin_popup", { show: false }).catch(() => {});
     deliver("compact", panel.compact);
     if (hello.character) deliver("character", hello.character);
     run = hello.run;

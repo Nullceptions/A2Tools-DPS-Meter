@@ -45,9 +45,6 @@
       if (permission === "events:character") {
         return t("settings.plugins.permCharacter", "See your character's name, server, class and level");
       }
-      if (permission === "popup") {
-        return t("settings.plugins.permPopup", "Pop up over the game by itself when it has something to show");
-      }
       if (permission.startsWith("decoder:")) {
         return t("settings.plugins.permDecoder", "Read your own game data: {name}", { name: permission.slice(8) });
       }
@@ -211,13 +208,6 @@
           title.push(" ", tag);
         }
         const buttons = [];
-        if (!p.error && p.popup) {
-          buttons.push(button(
-            p.popupOn ? t("settings.plugins.popupOn", "Pops up: on") : t("settings.plugins.popupOff", "Pops up: off"),
-            () => run(invoke("plugin_set_popup", { id: p.id, enabled: !p.popupOn })),
-            p.popupOn ? "hotkeyConsentConfirm" : undefined,
-          ));
-        }
         if (!p.error) {
           buttons.push(button(t("settings.plugins.open", "Open"), () => invoke("plugin_open", { id: p.id }).catch((e) => say(String(e)))));
         }

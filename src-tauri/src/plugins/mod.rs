@@ -35,11 +35,6 @@ pub const DEV_FOLDERS_KEY: &str = "dpsMeter.devPlugins";
 /// The scheme plugin files are served from (`http://a2plugin.localhost/` on
 /// Windows, `a2plugin://localhost/` elsewhere).
 pub const SCHEME: &str = "a2plugin";
-/// Plugins (with the `popup` permission) whose pop-up the user turned off, a
-/// JSON array of ids. A pop-up plugin is on unless listed.
-pub const POPUPS_OFF_KEY: &str = "dpsMeter.pluginPopupsOff";
-/// Where a plugin window was last left, `"x,y"` (physical pixels), per id.
-const POSITION_PREFIX: &str = "dpsMeter.pluginWindow.";
 /// The plugin API version this meter speaks.
 const API_VERSION: u32 = 1;
 /// Largest value one storage key may hold.
@@ -93,10 +88,6 @@ pub struct PluginInfo {
     pub reviewed: bool,
     /// Set when the folder could not be loaded.
     pub error: Option<String>,
-    /// It may pop up by itself (the `popup` permission)...
-    pub popup: bool,
-    /// ...and the user has that on.
-    pub popup_on: bool,
 }
 
 /// What Settings shows: developer mode, and each folder's plugin (or error).
@@ -113,12 +104,7 @@ fn view(app: &tauri::AppHandle, host: &PluginHost) -> PluginsView {
     let dev_mode = app
         .try_state::<AppState>()
         .is_some_and(|s| s.settings.get(DEV_MODE_KEY).as_deref() == Some("true"));
-    let off = popups_off(app);
-    let mut plugins = host.list();
-    for p in &mut plugins {
-        p.popup_on = p.popup && p.error.is_none() && !off.contains(&p.id);
-    }
-    PluginsView { dev_mode, online: cfg!(feature = "online"), plugins }
+    PluginsView { dev_mode, online: cfg!(feature = "online"), plugins: host.list() }
 }
 
 /// Where reviewed plugins are installed.
@@ -147,9 +133,6 @@ pub struct PluginHost {
     seq: Mutex<u64>,
     run: String,
     flusher: AtomicBool,
-    /// Plugin ids whose window is a pop-up now (hidden until the plugin shows
-    /// it), rather than a panel the user opened.
-    popups: Mutex<std::collections::HashSet<String>>,
 }
 
 impl Default for PluginHost {
@@ -166,7 +149,6 @@ impl Default for PluginHost {
             seq: Mutex::new(0),
             run,
             flusher: AtomicBool::new(false),
-            popups: Mutex::default(),
         }
     }
 }
@@ -242,8 +224,6 @@ impl PluginHost {
                     permissions: Vec::new(),
                     reviewed: false,
                     error: Some(e),
-                    popup: false,
-                    popup_on: false,
                 }),
             }
         }
@@ -288,20 +268,6 @@ impl PluginHost {
             crate::capture::frame_tap::set(Some(Arc::new(move |packet: &[u8]| host.on_frame(&app, packet))));
         } else {
             crate::capture::frame_tap::set(None);
-        }
-        sync_popups(app);
-    }
-
-    fn is_popup(&self, id: &str) -> bool {
-        self.popups.lock().unwrap_or_else(|p| p.into_inner()).contains(id)
-    }
-
-    fn set_popup(&self, id: &str, popup: bool) {
-        let mut popups = self.popups.lock().unwrap_or_else(|p| p.into_inner());
-        if popup {
-            popups.insert(id.to_string());
-        } else {
-            popups.remove(id);
         }
     }
 
@@ -393,13 +359,7 @@ fn info(l: &Loaded) -> PluginInfo {
         permissions: l.manifest.permissions.clone(),
         reviewed: l.reviewed,
         error: None,
-        popup: can_pop_up(&l.manifest),
-        popup_on: false,
     }
-}
-
-fn can_pop_up(manifest: &Manifest) -> bool {
-    manifest.permissions.iter().any(|p| p == "popup")
 }
 
 /// The plugin a `plugin-<id>` window belongs to.
@@ -662,220 +622,42 @@ pub fn plugin_remove_folder(app: tauri::AppHandle, path: String) -> Result<Plugi
     Ok(view(&app, &host))
 }
 
-/// A plugin's window sizes from its manifest: the panel (width, height) and
-/// the pop-up's width.
-fn window_sizes(manifest: &Manifest) -> (f64, f64, f64) {
-    let ui = manifest.ui.as_ref();
-    let dim = |part: &str, key: &str, default: f64, min: f64| {
-        ui.and_then(|u| u.get(part))
-            .and_then(|p| p.get(key))
-            .and_then(Value::as_f64)
-            .unwrap_or(default)
-            .clamp(min, 1200.0)
-    };
-    (dim("panel", "width", 360.0, 240.0), dim("panel", "height", 480.0, 200.0), dim("popup", "width", 280.0, 160.0))
-}
-
-/// Build a plugin's window: a panel (shown, focusable, resizable), or a
-/// pop-up (hidden until the plugin shows it, never taking focus from the
-/// game, sized to what it shows).
-fn build_window(app: &tauri::AppHandle, id: &str, popup: bool) -> Result<tauri::WebviewWindow, String> {
-    let host = host(app)?;
-    let (name, (width, height, popup_width)) =
-        host.with(id, |l| (l.manifest.name.clone(), window_sizes(&l.manifest))).ok_or("no such plugin")?;
+/// Open a plugin's window.
+/// Async: on Windows, building a window from a synchronous command deadlocks.
+#[tauri::command]
+pub async fn plugin_open(app: tauri::AppHandle, id: String) -> Result<(), String> {
+    let host = host(&app)?;
+    let (name, width, height) = host
+        .with(&id, |l| {
+            let panel = l.manifest.ui.as_ref().and_then(|u| u.get("panel"));
+            let dim = |key: &str, default: f64| {
+                panel.and_then(|p| p.get(key)).and_then(Value::as_f64).unwrap_or(default).clamp(240.0, 1200.0)
+            };
+            (l.manifest.name.clone(), dim("width", 360.0), dim("height", 480.0))
+        })
+        .ok_or("no such plugin")?;
     let label = format!("plugin-{id}");
-    let init = format!(
-        "window.__A2_PLUGIN_ID__ = {}; window.__A2_PLUGIN_POPUP__ = {popup};",
-        serde_json::to_string(id).unwrap_or_default()
-    );
-    let builder = tauri::WebviewWindowBuilder::new(app, &label, tauri::WebviewUrl::App("plugin-host.html".into()))
-        .initialization_script(init)
+    if let Some(window) = app.get_webview_window(&label) {
+        let _ = window.show();
+        let _ = window.set_focus();
+        return Ok(());
+    }
+    tauri::WebviewWindowBuilder::new(&app, &label, tauri::WebviewUrl::App("plugin-host.html".into()))
+        .initialization_script(format!("window.__A2_PLUGIN_ID__ = {};", serde_json::to_string(&id).unwrap_or_default()))
         .title(format!("{name} (plugin)"))
+        .inner_size(width, height + 30.0)
+        .min_inner_size(240.0, 200.0)
         .decorations(false)
         .always_on_top(true)
+        .resizable(true)
         // Transparent, so the panel's opacity slider shows the game through it.
         .transparent(true)
         // No system border or shadow (Windows 11 draws both on a frameless
         // window): the page draws its own edge, which fades with the panel.
-        .shadow(false);
-    let builder = if popup {
-        builder
-            .inner_size(popup_width, 60.0)
-            .min_inner_size(160.0, 30.0)
-            .resizable(false)
-            .skip_taskbar(true)
-            .focused(false)
-            .focusable(false)
-            // Hidden until it has something to show. On Windows a hidden
-            // WebView2 window may never load, so there it starts shown and
-            // its page hides it once loaded.
-            .visible(cfg!(windows))
-    } else {
-        builder.inner_size(width, height + 30.0).min_inner_size(240.0, 200.0).resizable(true)
-    };
-    host.set_popup(id, popup);
-    let window = builder.build().map_err(|e| e.to_string())?;
-    if let Some((x, y)) = saved_position(app, id) {
-        let _ = window.set_position(tauri::PhysicalPosition::new(x, y));
-    }
-    Ok(window)
-}
-
-/// Turn a plugin's window into its panel, or back into its pop-up.
-fn switch_mode(app: &tauri::AppHandle, window: &tauri::WebviewWindow, id: &str, popup: bool) {
-    let Ok(host) = host(app) else { return };
-    let Some((width, height, popup_width)) = host.with(id, |l| window_sizes(&l.manifest)) else { return };
-    host.set_popup(id, popup);
-    if popup {
-        let _ = window.hide();
-        let _ = window.set_focusable(false);
-        let _ = window.set_resizable(false);
-        let _ = window.set_min_size(Some(tauri::LogicalSize::new(160.0, 30.0)));
-        let _ = window.set_size(tauri::LogicalSize::new(popup_width, 60.0));
-    } else {
-        let _ = window.set_focusable(true);
-        let _ = window.set_resizable(true);
-        let _ = window.set_min_size(Some(tauri::LogicalSize::new(240.0, 200.0)));
-        let _ = window.set_size(tauri::LogicalSize::new(width, height + 30.0));
-        let _ = window.show();
-        let _ = window.set_focus();
-    }
-    let _ = app.emit_to(window.label(), "plugin-mode", if popup { "popup" } else { "panel" });
-}
-
-/// The ids whose pop-up the user turned off.
-fn popups_off(app: &tauri::AppHandle) -> Vec<String> {
-    app.try_state::<AppState>()
-        .and_then(|s| s.settings.get(POPUPS_OFF_KEY))
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
-}
-
-/// Start the pop-up of every loaded plugin that has one on, and close those
-/// turned off. In a task: building a window from a command deadlocks on Windows.
-fn sync_popups(app: &tauri::AppHandle) {
-    let app = app.clone();
-    tauri::async_runtime::spawn(async move {
-        let Ok(host) = host(&app) else { return };
-        let off = popups_off(&app);
-        let wanted: Vec<String> = host
-            .loaded
-            .read()
-            .unwrap_or_else(|p| p.into_inner())
-            .iter()
-            .filter(|l| can_pop_up(&l.manifest) && !off.contains(&l.manifest.id))
-            .map(|l| l.manifest.id.clone())
-            .collect();
-        for (label, window) in app.webview_windows() {
-            let Some(id) = label.strip_prefix("plugin-") else { continue };
-            if host.is_popup(id) && !wanted.iter().any(|w| w == id) {
-                host.set_popup(id, false);
-                let _ = window.close();
-            }
-        }
-        for id in wanted {
-            if app.get_webview_window(&format!("plugin-{id}")).is_none() {
-                match build_window(&app, &id, true) {
-                    Ok(_) => tracing::info!("Plugins: {id} runs as a pop-up"),
-                    Err(e) => tracing::warn!("Plugins: {id}'s pop-up did not start: {e}"),
-                }
-            }
-        }
-    });
-}
-
-fn saved_position(app: &tauri::AppHandle, id: &str) -> Option<(i32, i32)> {
-    let value = app.try_state::<AppState>()?.settings.get(&format!("{POSITION_PREFIX}{id}"))?;
-    let (x, y) = value.split_once(',')?;
-    Some((x.trim().parse().ok()?, y.trim().parse().ok()?))
-}
-
-/// A plugin window moved: remember where, once it has stopped moving.
-pub fn note_moved(app: &tauri::AppHandle, label: &str, at: tauri::PhysicalPosition<i32>) {
-    static LATEST: std::sync::OnceLock<Mutex<HashMap<String, (i32, i32)>>> = std::sync::OnceLock::new();
-    let Some(id) = label.strip_prefix("plugin-").filter(|id| valid_id(id)).map(str::to_string) else { return };
-    let latest = LATEST.get_or_init(Mutex::default);
-    let first = latest.lock().unwrap_or_else(|p| p.into_inner()).insert(id.clone(), (at.x, at.y)).is_none();
-    if !first {
-        return;
-    }
-    let app = app.clone();
-    tauri::async_runtime::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(600)).await;
-        let Some((x, y)) = latest.lock().unwrap_or_else(|p| p.into_inner()).remove(&id) else { return };
-        if let Some(state) = app.try_state::<AppState>() {
-            state.settings.set(&format!("{POSITION_PREFIX}{id}"), &format!("{x},{y}"));
-        }
-    });
-}
-
-/// Open a plugin's window as a panel (a pop-up's window turns into one).
-/// Async: on Windows, building a window from a synchronous command deadlocks.
-#[tauri::command]
-pub async fn plugin_open(app: tauri::AppHandle, id: String) -> Result<(), String> {
-    host(&app)?.with(&id, |_| ()).ok_or("no such plugin")?;
-    if let Some(window) = app.get_webview_window(&format!("plugin-{id}")) {
-        switch_mode(&app, &window, &id, false);
-        return Ok(());
-    }
-    build_window(&app, &id, false).map(|_| ())
-}
-
-/// Turn a pop-up on or off for a plugin that has one.
-#[tauri::command]
-pub fn plugin_set_popup(app: tauri::AppHandle, id: String, enabled: bool) -> Result<PluginsView, String> {
-    let state = app.try_state::<AppState>().ok_or("no app state")?;
-    let mut off = popups_off(&app);
-    off.retain(|x| x != &id);
-    if !enabled {
-        off.push(id);
-    }
-    state.settings.set(POPUPS_OFF_KEY, &serde_json::to_string(&off).unwrap_or_default());
-    let host = host(&app)?;
-    sync_popups(&app);
-    Ok(view(&app, &host))
-}
-
-/// From a pop-up's page: show or hide it, and fit its height to what it
-/// shows. Only while it is a pop-up; a panel stays as the user left it.
-#[tauri::command]
-pub fn plugin_popup(app: tauri::AppHandle, window: tauri::WebviewWindow, show: Option<bool>, height: Option<f64>) -> Result<bool, String> {
-    let id = window_plugin(&window)?;
-    require(&app, &id, "popup")?;
-    if !host(&app)?.is_popup(&id) {
-        return Ok(false);
-    }
-    if let Some(height) = height.filter(|h| h.is_finite()) {
-        let scale = window.scale_factor().unwrap_or(1.0);
-        let width = window.inner_size().map(|s| f64::from(s.width) / scale).unwrap_or(280.0);
-        let _ = window.set_size(tauri::LogicalSize::new(width, height.clamp(30.0, 800.0)));
-    }
-    match show {
-        Some(true) => {
-            let _ = window.show();
-        }
-        Some(false) => {
-            let _ = window.hide();
-        }
-        None => {}
-    }
-    Ok(true)
-}
-
-/// From a plugin window's close button: a panel whose plugin has its pop-up
-/// on goes back to being that pop-up (hidden), anything else closes.
-#[tauri::command]
-pub fn plugin_close(app: tauri::AppHandle, window: tauri::WebviewWindow) -> Result<bool, String> {
-    let id = window_plugin(&window)?;
-    let host = host(&app)?;
-    let keep = host.with(&id, |l| can_pop_up(&l.manifest)).unwrap_or(false) && !popups_off(&app).contains(&id);
-    if keep {
-        switch_mode(&app, &window, &id, true);
-    } else {
-        host.set_popup(&id, false);
-        let _ = window.close();
-    }
-    Ok(keep)
+        .shadow(false)
+        .build()
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
 // ── Plugin windows ─────────────────────────────────────────────────────────
@@ -901,7 +683,6 @@ pub fn plugin_hello(app: tauri::AppHandle, window: tauri::WebviewWindow) -> Resu
         "character": character,
         "language": language,
         "reviewed": reviewed,
-        "popup": host.is_popup(&id),
     }))
 }
 

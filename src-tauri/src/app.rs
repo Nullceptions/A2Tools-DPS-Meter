@@ -2608,12 +2608,6 @@ pub fn run() {
         // Closing the meter quits, even with Details, History or a kept
         // Settings window still open.
         .on_window_event(|window, event| {
-            // Plugin windows open where they were left.
-            if let tauri::WindowEvent::Moved(at) = event
-                && window.label().starts_with("plugin-")
-            {
-                crate::plugins::note_moved(window.app_handle(), window.label(), *at);
-            }
             if window.label() == "main"
                 && let tauri::WindowEvent::CloseRequested { api, .. } = event
             {
@@ -3164,9 +3158,6 @@ pub fn run() {
             crate::plugins::plugin_uninstall,
             crate::plugins::plugin_debug_frame,
             crate::plugins::plugin_open,
-            crate::plugins::plugin_set_popup,
-            crate::plugins::plugin_popup,
-            crate::plugins::plugin_close,
             crate::plugins::plugin_hello,
             crate::plugins::plugin_storage_get,
             crate::plugins::plugin_storage_set,

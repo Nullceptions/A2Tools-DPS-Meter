@@ -7198,5 +7198,3 @@ html.a2-offline .historyUploadBtn {
 .timersLead:disabled { opacity: 0.4; }
 .timersAlertSettings label:last-child { margin-left: 8px; }
 .header .headerBtns .closeBtn:hover { color: var(--error-fill); }
-/* Hidden Cube nearby: stays until the cube is gone or clicked away. */
-.timerAlert.timerCube { border-color: #f5c542; color: #f5c542; font-weight: 600; }

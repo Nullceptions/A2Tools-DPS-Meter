@@ -2951,17 +2951,6 @@ class DpsApp {
 
     this.initializeSettingsDropdowns();
 
-    // Diagnostics: a recorded Hidden Cube spawn through the packet reader.
-    document.querySelector(".cubeTestBtn")?.addEventListener("click", async () => {
-      const status = document.querySelector(".cubeTestStatus");
-      try {
-        await window.__TAURI__.core.invoke("simulate_hidden_cube");
-        if (status) status.textContent = "Cube packet sent. The meter should show \"Hidden Cube nearby\" and beep; it clears in 30 s.";
-      } catch (error) {
-        if (status) status.textContent = `Test failed: ${error}`;
-      }
-    });
-
     // Quits like the tray's Quit: saves the fight history first.
     document.querySelector(".closeBtn")?.addEventListener("click", () => {
       window.javaBridge?.exitApp?.();

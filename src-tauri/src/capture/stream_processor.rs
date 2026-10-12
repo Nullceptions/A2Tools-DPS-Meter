@@ -74,13 +74,6 @@ pub struct StreamProcessor {
 /// The `42 36` flag of an entity leaving the world, a spirit unsummoned among
 /// others (197 of the 370 in a 2026-10-06 capture were linked spirits).
 const DESPAWN_FLAG: i32 = 7;
-/// The Hidden Cube: a world object (`34 36` record) with this code, 0x13DACF.
-/// Three captures (2026-10-11) show the same life: `34 36` as it comes into
-/// range, `38 36 <cube> <player>` when someone starts opening it, `3a 36` as it
-/// opens and drops loot, `35 36 <cube> 04 03 00` when it is removed. (Object
-/// code 2950007 in `41 36` records, taken for the cube before, is something at
-/// General Goods Merchants.)
-const HIDDEN_CUBE_CODE: u32 = 0x13_DACF;
 
 impl StreamProcessor {
     pub fn new(data_storage: Arc<DataStorage>, skill_lookup: Arc<SkillLookup>, npc_lookup: Arc<NpcLookup>) -> Self {
@@ -287,8 +280,6 @@ impl StreamProcessor {
         self.parse_zone_change_packet(packet);
         self.parse_map_load_packet(packet);
         self.parse_field_boss_list_packet(packet);
-        self.parse_own_position_packet(packet);
-        self.parse_world_object_packet(packet);
 
         if !parsed_damage && !parsed_name && !parsed_summon && !parsed_ownership && !parsed_hp {
             self.parse_dot_packet(packet);
@@ -363,13 +354,6 @@ impl StreamProcessor {
             return;
         }
         self.data_storage.note_zone_change();
-        if self.override_timestamp.is_none() && !crate::clock::is_overridden() {
-            self.data_storage.clear_cubes_in_range(crate::clock::now_ms());
-            // `23 36 00 <6 bytes> <x y z f32>`: where the teleport put you.
-            if let Some(pos) = read_position(packet, offset + 9) {
-                self.data_storage.note_own_position(pos, crate::clock::now_ms());
-            }
-        }
     }
 
     // ===== MAP LOAD (21 36) =====
@@ -389,97 +373,6 @@ impl StreamProcessor {
         }
         let map_id = parse_u32_le(packet, offset + 6) as i32;
         self.data_storage.note_map_load(map_id);
-    }
-
-    // ===== WORLD OBJECTS (34 36 / 35 36) =====
-
-    /// `34 36 <entity varint> 04 00 <code u32> <x y z f32> …`: a world object
-    /// (gathering nodes, the Hidden Cube) coming into range, and
-    /// `35 36 <entity varint> <flags…>` removing one: `04 03 00` after a cube
-    /// was opened, `01 01 00` (the common one) presumably out of range.
-    /// Only Hidden Cubes are kept.
-    fn parse_world_object_packet(&self, packet: &[u8]) {
-        let length_info = read_varint(packet, 0);
-        if length_info.length <= 0 {
-            return;
-        }
-        let offset = length_info.length as usize;
-        let (Some(&op), Some(&0x36)) = (packet.get(offset), packet.get(offset + 1)) else { return };
-        if op != 0x34 && op != 0x35 {
-            return;
-        }
-        let id = read_varint(packet, offset + 2);
-        if id.length <= 0 {
-            return;
-        }
-        if self.override_timestamp.is_some() || crate::clock::is_overridden() {
-            return;
-        }
-        let entity = id.value;
-        let at = offset + 2 + id.length as usize;
-        if op == 0x35 {
-            self.data_storage.note_cube_gone(entity);
-            return;
-        }
-        let Some(code) = packet.get(at + 2..at + 6).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]])) else { return };
-        if code != HIDDEN_CUBE_CODE {
-            return;
-        }
-        let Some(pos) = read_position(packet, at + 6) else { return };
-        tracing::info!("Hidden Cube {entity} in range at {pos:?}");
-        self.data_storage.note_cube_spawn((entity, pos[0].to_bits()), pos, crate::clock::now_ms());
-    }
-
-    // ===== OWN POSITION (2A 38) =====
-
-    /// `2a 38 <your entity> … ff×8 <8 bytes> <your entity> 01 00 <x y z f32>`:
-    /// a record about you, sent every few seconds while you move, that states
-    /// where you are. Read from a 2026-10-11 capture: its points trace a smooth
-    /// path, and the first after a teleport is the teleport's destination.
-    /// Used for the distance to a Hidden Cube.
-    ///
-    /// Also `2b 38 <your entity> … <u64 ms> <your entity> … <x y z f32>`: an
-    /// effect of yours ticking on you once a second (a Chanter's mantras), which
-    /// ends with where you are. While one runs it fills the gaps between `2a 38`
-    /// records, which come every ~3 s in flight and sometimes 10-30 s apart.
-    /// From a capture of 2026-10-12: its points follow the `2a 38` path, and the
-    /// tick after a `2a 38` repeats that record's position exactly.
-    fn parse_own_position_packet(&self, packet: &[u8]) {
-        let length_info = read_varint(packet, 0);
-        if length_info.length <= 0 {
-            return;
-        }
-        let offset = length_info.length as usize;
-        let tick = match packet.get(offset..offset + 2) {
-            Some([0x2a, 0x38]) => false,
-            Some([0x2b, 0x38]) => true,
-            _ => return,
-        };
-        let Some(me) = self.data_storage.local_player_id() else { return };
-        let id = read_varint(packet, offset + 2);
-        if id.length <= 0 || id.value as i64 != me {
-            return;
-        }
-        let mut anchor = encode_varint(id.value as u32);
-        if !tick {
-            anchor.extend_from_slice(&[0x01, 0x00]);
-        }
-        let from = offset + 2 + id.length as usize;
-        let Some(at) = packet[from..].windows(anchor.len()).position(|w| w == anchor.as_slice()) else { return };
-        let at = if tick {
-            // On you, not on someone else: your entity again after the time.
-            if from + at + anchor.len() + 12 > packet.len() {
-                return;
-            }
-            packet.len() - 12
-        } else {
-            from + at + anchor.len()
-        };
-        if let Some(pos) = read_position(packet, at) {
-            if self.override_timestamp.is_none() && !crate::clock::is_overridden() {
-                self.data_storage.note_own_position(pos, crate::clock::now_ms());
-            }
-        }
     }
 
     // ===== FIELD BOSS LIST (01 91) =====
@@ -2593,26 +2486,6 @@ enum UnicodeScript {
 /// Your server (u16) and class (u32, the roster's encoding), which follow the
 /// name in a self record. The server must read as one; the class need not,
 /// as Amber1's record on Nezekan (2026-10-01) has other bytes there.
-/// Three `f32`s at `at`, if they look like world coordinates.
-fn read_position(data: &[u8], at: usize) -> Option<[f32; 3]> {
-    let b = data.get(at..at + 12)?;
-    let f = |i: usize| f32::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]);
-    let pos = [f(0), f(4), f(8)];
-    pos.iter().all(|v| v.is_finite() && v.abs() < 2_000_000.0).then_some(pos)
-}
-
-fn encode_varint(mut value: u32) -> Vec<u8> {
-    let mut out = Vec::new();
-    loop {
-        let byte = (value & 0x7f) as u8;
-        value >>= 7;
-        out.push(if value > 0 { byte | 0x80 } else { byte });
-        if value == 0 {
-            return out;
-        }
-    }
-}
-
 fn self_profile(data: &[u8], after: usize) -> Option<(u16, Option<JobClass>)> {
     let rest = data.get(after..after + 2)?;
     let server = u16::from_le_bytes([rest[0], rest[1]]);
@@ -4048,77 +3921,6 @@ mod tests {
     }
 
 
-
-    /// A Hidden Cube's life from a capture (2026-10-11 23:53, entity 54879):
-    /// `34 36` as it comes into range, `35 36 … 04 03 00` once it was opened.
-    /// Through `consume_stream`, every reader seeing every packet, as live.
-    #[test]
-    fn a_hidden_cube_comes_and_goes() {
-        let storage = Arc::new(DataStorage::new());
-        let mut p = StreamProcessor::new(storage.clone(), Arc::new(SkillLookup::new()), Arc::new(NpcLookup::new()));
-        let frame = |body: Vec<u8>| [vec![super::super::framing::length_value(body.len()) as u8], body].concat();
-        let cube = hex(concat!(
-            "3436dfac030400cfda1300d529c7c7909099c7003b044700000000000000000101014373f42ca1",
-            "0100000000000000000000471751c6070000",
-        ));
-        p.consume_stream(&frame(cube.clone()));
-        assert!(storage.take_cube_spawn().is_some());
-        let cubes = storage.take_cubes_in_range_if_changed().expect("in range");
-        assert_eq!(cubes.len(), 1);
-        assert_eq!(cubes[0].1.map(|v| v.round() as i32), [-101972, -78625, 33851]);
-        // Sent again on coming back into range: no second beep.
-        p.consume_stream(&frame(cube));
-        assert!(storage.take_cube_spawn().is_none());
-        p.consume_stream(&frame(hex("3536dfac03040300")));
-        assert_eq!(storage.take_cubes_in_range_if_changed(), Some(vec![]));
-    }
-
-    /// A gathering node is a `34 36` world object too, with another code.
-    #[test]
-    fn other_world_objects_are_not_cubes() {
-        let storage = Arc::new(DataStorage::new());
-        let mut p = StreamProcessor::new(storage.clone(), Arc::new(SkillLookup::new()), Arc::new(NpcLookup::new()));
-        let frame = |body: Vec<u8>| [vec![super::super::framing::length_value(body.len()) as u8], body].concat();
-        p.consume_stream(&frame(hex("34368cee030400dda61700c08d4ac8c08d4ac8c08d4ac8")));
-        assert!(storage.take_cube_spawn().is_none());
-    }
-
-    /// A `2a 38` record about you from the 2026-10-11 capture (22:15:14), and
-    /// the cube from the same capture: you were about 108 m from it.
-    #[test]
-    fn your_position_gives_the_distance_to_a_cube() {
-        let storage = Arc::new(DataStorage::new());
-        let mut p = StreamProcessor::new(storage.clone(), Arc::new(SkillLookup::new()), Arc::new(NpcLookup::new()));
-        storage.set_local_identity_from_game(5359, Some("Nullception".into()));
-        let frame = |body: Vec<u8>| [vec![super::super::framing::length_value(body.len()) as u8], body].concat();
-        p.consume_stream(&frame(hex(concat!(
-            "2a38ef290111d4d30102e1f505ffffffffffffffff8075d52abb030000",
-            "ef290100cae7e747c5b1e047f834f442",
-        ))));
-        let (pos, _) = storage.own_position().expect("position read");
-        assert_eq!(pos.map(|v| v.round() as i32), [118736, 115044, 122]);
-    }
-
-    /// A mantra tick of yours from the 2026-10-12 capture (00:56:36): the
-    /// position of the `2a 38` record half a second before, (-141169,-104995,36496).
-    #[test]
-    fn your_mantra_ticks_say_where_you_are() {
-        let storage = Arc::new(DataStorage::new());
-        let mut p = StreamProcessor::new(storage.clone(), Arc::new(SkillLookup::new()), Arc::new(NpcLookup::new()));
-        storage.set_local_identity_from_game(15712, Some("Nullception".into()));
-        let frame = |body: Vec<u8>| [vec![super::super::framing::length_value(body.len()) as u8], body].concat();
-        let tick = |who: &str| {
-            hex(&format!(
-                "2b38{who}139214b393d70a600900000000000007b72e2da1010000{who}0ec58e15010258dc09c84911cdc700900e47"
-            ))
-        };
-        // Someone else's tick says nothing about you.
-        p.consume_stream(&frame(tick("8c56")));
-        assert!(storage.own_position().is_none());
-        p.consume_stream(&frame(tick("e07a")));
-        let (pos, _) = storage.own_position().expect("position read");
-        assert_eq!(pos.map(|v| v.round() as i32), [-141169, -104995, 36496]);
-    }
 
     /// The start of another self record (2026-10-11): Nullception, server
     /// 2312, level 45, gear score 2040 as the character sheet showed it.

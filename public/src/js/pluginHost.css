@@ -107,3 +107,26 @@ body {
   background: rgba(30, 40, 60, 0.96);
   border: 1px solid rgba(255, 255, 255, 0.12);
 }
+/* A pop-up: only the plugin's own content under a slim bar to drag it by,
+   with the unreviewed badge (when it applies) and the close button. */
+body.popup .pluginName,
+body.popup .pluginOpacity,
+body.popup .pluginCompact,
+body.popup .pluginToast {
+  display: none;
+}
+body.popup .pluginBar {
+  justify-content: flex-end;
+  min-height: 12px;
+  padding: 2px 6px;
+}
+body.popup .pluginBadge {
+  margin-right: auto;
+  padding: 0 5px;
+  font-size: 10px;
+}
+body.popup .pluginClose,
+body.popup .pluginClose svg {
+  width: 12px;
+  height: 12px;
+}

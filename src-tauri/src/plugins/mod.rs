@@ -39,6 +39,9 @@ pub const SCHEME: &str = "a2plugin";
 /// The newest plugin API this meter speaks; it runs older ones too.
 /// 2 added decoders' `self` field and `a2.window` (the `window` permission).
 const API_VERSION: u32 = 2;
+/// Shortest a plugin may make its window's content (`ui.panel.height`), so
+/// one that pops up a line or two, such as an alert, takes no more room.
+const MIN_PANEL_HEIGHT: f64 = 60.0;
 /// Which plugin windows were open, and whether hidden, when the meter last
 /// ran: a JSON object of id → "shown" | "hidden". They open again at start, so
 /// a plugin that watches in the background (hidden) keeps doing so.
@@ -720,10 +723,10 @@ fn open_window(app: &tauri::AppHandle, id: &str, visible: bool) -> Result<(), St
     let (name, width, height) = host
         .with(id, |l| {
             let panel = l.manifest.ui.as_ref().and_then(|u| u.get("panel"));
-            let dim = |key: &str, default: f64| {
-                panel.and_then(|p| p.get(key)).and_then(Value::as_f64).unwrap_or(default).clamp(240.0, 1200.0)
+            let dim = |key: &str, default: f64, min: f64| {
+                panel.and_then(|p| p.get(key)).and_then(Value::as_f64).unwrap_or(default).clamp(min, 1200.0)
             };
-            (l.manifest.name.clone(), dim("width", 360.0), dim("height", 480.0))
+            (l.manifest.name.clone(), dim("width", 360.0, 240.0), dim("height", 480.0, MIN_PANEL_HEIGHT))
         })
         .ok_or("no such plugin")?;
     let label = format!("plugin-{id}");
@@ -740,7 +743,7 @@ fn open_window(app: &tauri::AppHandle, id: &str, visible: bool) -> Result<(), St
         .initialization_script(format!("window.__A2_PLUGIN_ID__ = {};", serde_json::to_string(id).unwrap_or_default()))
         .title(format!("{name} (plugin)"))
         .inner_size(width, height + 30.0)
-        .min_inner_size(240.0, 200.0)
+        .min_inner_size(240.0, (height + 30.0).min(230.0))
         .decorations(false)
         .always_on_top(true)
         .resizable(true)

@@ -794,23 +794,6 @@ pub fn serve(app: &tauri::AppHandle, path: &str) -> tauri::http::Response<Vec<u8
     if !file.starts_with(&root) || !file.is_file() {
         return respond(404, "text/plain", Vec::new());
     }
-    // On Linux a plugin page gets its scripts and styles inlined: WebKit
-    // refuses every file a sandboxed frame (an opaque origin) asks for from a
-    // custom scheme ("Unsafe attempt to load URL … from origin null"), so the
-    // page's own files never loaded and plugins sat inert (2.0.61).
-    if !cfg!(windows) && file.extension().is_some_and(|e| e == "html") {
-        if let Ok(html) = std::fs::read_to_string(&file) {
-            let (page, hashes) = inline_page(&html, &root, file.parent().unwrap_or(&root));
-            let policy = inlined_policy(id, &hashes);
-            return tauri::http::Response::builder()
-                .status(200)
-                .header("Content-Type", "text/html; charset=utf-8")
-                .header("Content-Security-Policy", policy.as_str())
-                .header("X-Content-Type-Options", "nosniff")
-                .body(page.into_bytes())
-                .unwrap_or_default();
-        }
-    }
     let kind = match file.extension().and_then(|e| e.to_str()).unwrap_or("") {
         "html" => "text/html; charset=utf-8",
         "js" => "text/javascript; charset=utf-8",
@@ -827,112 +810,6 @@ pub fn serve(app: &tauri::AppHandle, path: &str) -> tauri::http::Response<Vec<u8
         Ok(body) => respond(200, kind, body),
         Err(_) => respond(404, "text/plain", Vec::new()),
     }
-}
-
-/// A plugin page with its `<script src>` and stylesheet `<link>`s replaced by
-/// the files' contents, and the SHA-256 of each inlined script for the policy.
-/// Only the SDK and files inside the plugin's folder are inlined; any other
-/// tag is left as it is (and stays refused).
-fn inline_page(html: &str, root: &Path, page_dir: &Path) -> (String, Vec<String>) {
-    let read = |src: &str| -> Option<String> {
-        if src.trim_start_matches('/') == "_sdk/a2.js" {
-            return Some(SDK.to_string());
-        }
-        if src.contains(':') || src.starts_with('/') {
-            return None;
-        }
-        let file = page_dir.join(percent_decode(src.split(['?', '#']).next()?)).canonicalize().ok()?;
-        if !file.starts_with(root) {
-            return None;
-        }
-        std::fs::read_to_string(file).ok()
-    };
-    let mut out = String::with_capacity(html.len() * 2);
-    let mut hashes = Vec::new();
-    let mut rest = html;
-    while let Some(start) = rest.find('<') {
-        out.push_str(&rest[..start]);
-        rest = &rest[start..];
-        let Some(end) = rest.find('>') else { break };
-        let tag = &rest[..=end];
-        let lower = tag.to_ascii_lowercase();
-        if lower.starts_with("<script") && rest[end + 1..].to_ascii_lowercase().starts_with("</script>") {
-            if let Some(code) = attribute(tag, "src").and_then(|src| read(&src)) {
-                // "</script" inside the code would end the element early.
-                let code = code.replace("</script", "<\\/script");
-                hashes.push(sha256_base64(code.as_bytes()));
-                out.push_str("<script>");
-                out.push_str(&code);
-                out.push_str("</script>");
-                rest = &rest[end + 1 + "</script>".len()..];
-                continue;
-            }
-        } else if lower.starts_with("<link") && attribute(tag, "rel").is_some_and(|r| r.eq_ignore_ascii_case("stylesheet")) {
-            if let Some(css) = attribute(tag, "href").and_then(|href| read(&href)) {
-                out.push_str("<style>");
-                out.push_str(&css.replace("</style", "<\\/style"));
-                out.push_str("</style>");
-                rest = &rest[end + 1..];
-                continue;
-            }
-        }
-        out.push_str(tag);
-        rest = &rest[end + 1..];
-    }
-    out.push_str(rest);
-    (out, hashes)
-}
-
-/// An attribute's value in an opening tag, quoted or not.
-fn attribute(tag: &str, name: &str) -> Option<String> {
-    let lower = tag.to_ascii_lowercase();
-    let mut from = 0;
-    while let Some(i) = lower[from..].find(name) {
-        let at = from + i;
-        from = at + name.len();
-        let before = lower[..at].chars().last();
-        if !before.is_some_and(char::is_whitespace) {
-            continue;
-        }
-        let after = tag[from..].trim_start();
-        let Some(after) = after.strip_prefix('=') else { continue };
-        let after = after.trim_start();
-        let value = match after.chars().next()? {
-            q @ ('"' | '\'') => after[1..].split(q).next()?,
-            _ => after.split(|c: char| c.is_whitespace() || c == '>' || c == '/').next()?,
-        };
-        return Some(value.to_string());
-    }
-    None
-}
-
-fn sha256_base64(data: &[u8]) -> String {
-    use sha2::Digest;
-    const ABC: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let hash = sha2::Sha256::digest(data);
-    let mut out = String::new();
-    for chunk in hash.chunks(3) {
-        let n = chunk.iter().enumerate().fold(0u32, |n, (i, &b)| n | u32::from(b) << (16 - 8 * i));
-        for i in 0..4 {
-            if i <= chunk.len() {
-                out.push(ABC[(n >> (18 - 6 * i) & 63) as usize] as char);
-            } else {
-                out.push('=');
-            }
-        }
-    }
-    out
-}
-
-/// The policy for an inlined page: only its own inlined scripts run (by
-/// hash), its inlined styles apply, and nothing else loads but its images.
-fn inlined_policy(id: &str, hashes: &[String]) -> String {
-    let scripts: String = hashes.iter().map(|h| format!(" 'sha256-{h}'")).collect();
-    let own = if valid_id(id) { format!("a2plugin://localhost/{id}/") } else { "'none'".into() };
-    format!(
-        "default-src 'none'; script-src{}; style-src 'unsafe-inline'; img-src {own} data:; font-src {own} data:; connect-src 'none'; frame-src 'none'; base-uri 'none'; form-action 'none'",
-        if scripts.is_empty() { " 'none'".to_string() } else { scripts }
-    )
 }
 
 fn percent_decode(s: &str) -> String {
@@ -955,44 +832,7 @@ fn percent_decode(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{content_policy, inline_page, inlined_policy, sha256_base64};
-
-    #[test]
-    fn a_page_gets_its_own_scripts_and_styles_inlined() {
-        let dir = std::env::temp_dir().join(format!("a2plugin-inline-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("plugin")).unwrap();
-        std::fs::write(dir.join("plugin/plugin.js"), "go('</script>');").unwrap();
-        std::fs::write(dir.join("plugin/style.css"), "body{color:red}").unwrap();
-        std::fs::write(dir.join("secret.js"), "nope").unwrap();
-        let root = dir.join("plugin").canonicalize().unwrap();
-        let html = concat!(
-            "<link rel=\"stylesheet\" href=\"style.css\" />",
-            "<script src=\"/_sdk/a2.js\"></script>",
-            "<script src=\"plugin.js\"></script>",
-            "<script src=\"../secret.js\"></script>",
-            "<script src=\"https://example.com/x.js\"></script>",
-        );
-        let (page, hashes) = inline_page(html, &root, &root);
-        assert!(page.contains("<style>body{color:red}</style>"), "{page}");
-        assert!(page.contains("window.a2 = Object.freeze"), "the SDK");
-        assert!(page.contains("<script>go('<\\/script>');</script>"), "{page}");
-        // Outside the folder or elsewhere: left as a tag, which the policy refuses.
-        assert!(page.contains("<script src=\"../secret.js\"></script>"));
-        assert!(page.contains("https://example.com/x.js"));
-        assert_eq!(hashes.len(), 2);
-        assert_eq!(hashes[1], sha256_base64(b"go('<\\/script>');"));
-        let policy = inlined_policy("plugin", &hashes);
-        assert!(policy.contains(&format!("script-src 'sha256-{}' 'sha256-{}';", hashes[0], hashes[1])), "{policy}");
-        assert!(policy.contains("connect-src 'none'"));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn sha256_in_base64() {
-        // printf abc | sha256sum | xxd -r -p | base64
-        assert_eq!(sha256_base64(b"abc"), "ungWv48Bz+pBQUDeXa4iI7ADYaOWF3qctBD/YfIAFa0=");
-    }
+    use super::content_policy;
 
     #[test]
     fn the_policy_names_the_plugins_own_files() {

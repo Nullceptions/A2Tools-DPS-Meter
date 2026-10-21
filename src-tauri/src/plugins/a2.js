@@ -10,7 +10,9 @@
 //                                              when the meter read it (unix ms), or null on meters
 //                                              that don't say
 //   a2.on("character", (c) => ...)             your character (name, serverId, class, level), at start and
-//                                              whenever it changes (meter 2.0.65 on)
+//                                              whenever it changes (meter 2.0.65 on); from meter 2.0.75
+//                                              also combatPower, gearScore and odyleEnergy ({ basic,
+//                                              charged }), each null until the game has said
 //   a2.on("bossMap", ({ map, bosses }) => ...) a map the player just opened, its field bosses as
 //                                              a2.bossTimers gives them (permission
 //                                              "feed:boss-timers", meter 2.0.65 on)

@@ -2213,16 +2213,26 @@ fn odyle_energy_in_list(body: &[u8]) -> Option<(u32, u32)> {
         })
 }
 
+/// The key of the Odyle energy entry (`87 93 03`), in every list and
+/// update seen, from several players.
+const ODYLE_KEY: i32 = 51_591;
+
 /// Odyle energy in a `0c 61` update, if among the entries that changed.
 ///
 /// The first byte is not a count: updates with `00` there carry an entry too
 /// (`0c 61 00 08 01 87 93 03 ab 0e 03`, 2026-10-15), and the meter skipped
-/// them. The entries are read from after it, at least one.
+/// them. The entries are read from after it, at least one. Only the entry
+/// with the energy's key: another in slot 1 (`0c 61 00 0c 01 00 00 00 04 01
+/// 03`, key 0) was read as 0 basic, 0 charged.
 fn odyle_energy_in_update(body: &[u8]) -> Option<(u32, u32)> {
     let count = (*body.first()?).max(1);
     let mut at = 1;
     for _ in 0..count {
-        let (kind, slot, _, v, next) = entry_count_at(body, at)?;
+        let (kind, slot, key, v, next) = entry_count_at(body, at)?;
+        if key != ODYLE_KEY {
+            at = next;
+            continue;
+        }
         if let Some(energy) = odyle_energy_of(kind, slot, v) {
             return Some(energy);
         }
@@ -4014,9 +4024,11 @@ mod tests {
         assert_eq!(storage.odyle_energy(), Some((0, 1755)));
         p.parse_perfect_packet(&hex("130c61010801879303cb0f01f0000000"));
         assert_eq!(storage.odyle_energy(), Some((0, 1995)));
-        // Updates without the energy change nothing.
+        // Updates without the energy change nothing, nor another entry in
+        // slot 1 (2026-10-17 15:06:54, logged as 0 basic, 0 charged).
         p.parse_perfect_packet(&hex("0e0c6100040c0000000e02"));
         p.parse_perfect_packet(&hex("0d0c6100000987930303"));
+        p.parse_perfect_packet(&hex("0f0c61000c01000000040103"));
         assert_eq!(storage.odyle_energy(), Some((0, 1995)));
     }
 

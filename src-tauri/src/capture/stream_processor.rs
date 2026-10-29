@@ -2396,7 +2396,7 @@ enum Entry {
 
 /// One entry of the entry counts read as the game lays it out, `<kind> <id
 /// u32 LE> <values>`: kind `00` no value (both 0), `01` a u64 (a time, not a
-/// count), `04` the first value, `08` the second, `0c` both (varints). Odyle
+/// count), `03` two u64, `04` the first value, `08` the second, `0c` both (varints). Odyle
 /// energy is id 60000001 (`01 87 93 03`), Shugo Festival keys id 1. Returns
 /// the entry and where the next begins. Ids seen run from 1 to 90000006 and
 /// counts stay in the thousands, so an id of 0 or past 99999999, or a count
@@ -2415,6 +2415,13 @@ fn content_entry_at(body: &[u8], at: usize) -> Option<(Entry, usize)> {
         0x01 => {
             let time = u64::from_le_bytes(body.get(o..o + 8)?.try_into().ok()?);
             return Some((Entry::Time(id, time), o + 8));
+        }
+        // Id 3 came as two u64 on 2026-10-29 (23768000, 3600000): its time,
+        // and a second one not read.
+        0x03 => {
+            let time = u64::from_le_bytes(body.get(o..o + 8)?.try_into().ok()?);
+            body.get(o + 8..o + 16)?;
+            return Some((Entry::Time(id, time), o + 16));
         }
         0x04 => v[0] = value(&mut o)?,
         0x08 => v[1] = value(&mut o)?,
@@ -4663,6 +4670,21 @@ mod tests {
         assert_eq!(storage.kinah_today_at(now), Some(1534));
         let list = storage.entry_list();
         assert_eq!((list.owner.as_deref(), list.kinah_today), (Some("Alt"), Some(1534)));
+    }
+
+    /// The login list after the game's 2026-10-29 change: id 3 comes as two
+    /// u64 (kind `03`), which the reader refused, dropping the whole list
+    /// (Nullception's login, 23:20 CET).
+    #[test]
+    fn the_login_list_with_a_two_u64_entry_reads() {
+        let (storage, mut p) = processor();
+        p.parse_perfect_packet(&hex("fc030b61490c01000000150c0303000000c0ab6a010000000080ee3600000000000c04000000060a000600000004070000002004080000000601090000008085800100000000040a0000000e040b00000002040c0000000e010d0000008085800100000000040e0000000e040f0000000e08650000000504660000000704670000000701c9000000808580010000000001ca000000808580010000000001cb000000808580010000000001cc000000808580010000000001cd000000808580010000000001ce0000008085800100000000008196980000829698000083969800008496980000859698000086969800008796980000889698000089969800008a969800008b969800008c9698000c0187930378ea0804028793030e04038793030e04048793030e04058793030e04068793031504078793032304088793031c04098793030a040a8793030704658793030e04c987930307044d8b93030704b18b93030e04358f93030704998f93030e041d9393030704819393030e04059793030704699793030704b59b930304049d9f93030404bda29303070421a393030e048daa93030704f1aa93030e0445b693030704a9b6930307042dba9303070415be93030704fdc193030704811d2c04030c01b4c404020104814a5d050404824a5d050104834a5d050404844a5d050204854a5d050404864a5d0502"));
+        let counts = storage.content_counts();
+        assert_eq!(counts.get(&1), Some(&[21, 12]));
+        assert_eq!(counts.get(&4), Some(&[6, 10]));
+        assert_eq!(counts.get(&80_000_001), Some(&[2, 1]));
+        assert_eq!(counts.get(&3), None);
+        assert_eq!(storage.odyle_energy(), Some((120, 1130)));
     }
 
     /// The whole entry-count list, by id, and its updates (Nullception's
